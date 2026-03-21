@@ -1,0 +1,30 @@
+[package]
+name = "ecphory"
+version = "0.10.0"
+edition = "2021"
+description = "The Ecphory Fabric — a computing paradigm where intent is the atomic primitive"
+license = "Apache-2.0"
+repository = "https://github.com/jtjones09/ecphory"
+keywords = ["intent-computing", "semantic-fabric", "resonance", "ai-architecture", "confidence-surfaces"]
+categories = ["algorithms", "data-structures", "science"]
+
+[dependencies]
+# Core library: ZERO external dependencies.
+# This is not negotiable (Law 8: Legacy Acknowledged, Not Worshipped).
+#
+# uuid is the sole bootstrap dependency — needed for LineageId
+# (stable identity across mutations). Will be replaced when the
+# fabric can generate its own native identity.
+uuid = { version = "1", features = ["v4"] }
+
+# Serialization — needed for fabric persistence (Phase 3a)
+# BOOTSTRAP: Phase 4+ replaces with native semantic representation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "ecphory"
+path = "src/lib.rs"
+
+# No binary target — ecphory is a library crate.
+# The CLI lives in the intent-node dev repo.
