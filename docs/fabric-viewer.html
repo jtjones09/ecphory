@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ecphory Fabric Viewer</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Newsreader:ital,wght@0,300;0,400;1,300;1,400&family=IBM+Plex+Mono:wght@300;400;500&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#06060b;--glass:rgba(18,18,32,0.55);--glass-border:rgba(255,255,255,0.06);--text:#d8d8e8;--text-dim:#8585a0;--text-muted:#4a4a65;--blue:#4d7aff;--cyan:#38e8c8;--rose:#ff4d6a;--amber:#ffb84d;--violet:#9d6aff;--peach:#ff7a5c;--green:#4ae88a}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:15px;line-height:1.75;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;opacity:0.03;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");background-size:128px}
+.ambient{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.ambient-blob{position:absolute;border-radius:50%;filter:blur(120px);opacity:0.05;animation:drift 25s ease-in-out infinite alternate}
+.ab1{width:500px;height:500px;background:var(--blue);top:-10%;left:-5%}.ab2{width:400px;height:400px;background:var(--cyan);bottom:-15%;right:-5%;animation-delay:-8s}
+@keyframes drift{0%{transform:translate(0,0) scale(1)}50%{transform:translate(40px,-30px) scale(1.1)}100%{transform:translate(-20px,40px) scale(0.95)}}
+
+.header{position:sticky;top:0;z-index:100;background:rgba(6,6,11,0.88);backdrop-filter:blur(32px);border-bottom:1px solid var(--glass-border);padding:0 32px;display:flex;align-items:center;gap:16px;height:54px}
+.logo{font-family:'Newsreader',serif;font-size:18px;font-style:italic;font-weight:600;color:var(--blue)}
+.logo-sub{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--text-muted);border:1px solid rgba(255,255,255,0.08);padding:2px 7px;border-radius:3px}
+.stats{display:flex;gap:20px;margin-left:auto;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim)}
+.stat-val{color:var(--cyan);font-weight:500}
+
+/* Upload zone */
+.upload-zone{position:relative;z-index:1;padding:40px 32px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:16px}
+.upload-zone.hidden{display:none}
+.drop-area{border:2px dashed rgba(255,255,255,0.1);border-radius:16px;padding:48px 32px;max-width:600px;width:100%;cursor:pointer;transition:all 0.3s}
+.drop-area:hover{border-color:var(--blue);background:rgba(77,122,255,0.05)}
+.drop-area h2{font-family:'Newsreader',serif;font-size:28px;font-style:italic;font-weight:300;margin-bottom:8px}
+.drop-area p{color:var(--text-dim);font-size:13px}
+.drop-area code{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--cyan);background:rgba(56,232,200,0.1);padding:2px 8px;border-radius:4px}
+input[type=file]{display:none}
+
+.cli-help{max-width:600px;width:100%;background:var(--glass);border:1px solid var(--glass-border);border-radius:12px;padding:20px 24px;text-align:left;display:none}
+.cli-help.visible{display:block}
+.cli-help h3{font-family:'Newsreader',serif;font-size:16px;font-weight:400;margin-bottom:12px;color:var(--text)}
+.cli-help pre{font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--cyan);background:rgba(0,0,0,0.3);padding:12px 16px;border-radius:8px;overflow-x:auto;line-height:1.8}
+.cli-btn{padding:8px 16px;border-radius:8px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:500;color:var(--blue);border:1px solid rgba(77,122,255,0.25);background:rgba(77,122,255,0.08);transition:all 0.3s;outline:none}
+.cli-btn:hover{background:rgba(77,122,255,0.15);border-color:rgba(77,122,255,0.4)}
+
+/* Cost summary bar */
+.cost-bar{position:relative;z-index:1;padding:10px 32px;display:none;gap:24px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-dim);background:rgba(255,184,77,0.04);border-bottom:1px solid rgba(255,184,77,0.1);align-items:center}
+.cost-bar.visible{display:flex}
+.cost-bar .cost-label{color:var(--amber);font-weight:500}
+.cost-bar .cost-val{color:var(--amber);font-size:14px;font-weight:600}
+.cost-bar .cost-detail{color:var(--text-muted)}
+
+/* Filters */
+.filters{padding:16px 32px;display:flex;gap:6px;flex-wrap:wrap;position:relative;z-index:1}
+.filters.hidden{display:none}
+.fbtn{padding:5px 12px;border-radius:7px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;letter-spacing:0.4px;text-transform:uppercase;color:var(--text-muted);transition:all 0.3s;border:1px solid transparent;background:transparent;outline:none}
+.fbtn:hover{color:var(--text-dim);background:rgba(255,255,255,0.03)}
+.fbtn.on{color:var(--blue);border-color:rgba(77,122,255,0.25);background:rgba(77,122,255,0.08)}
+.fbtn.telemetry-btn{color:var(--amber);border-color:rgba(255,184,77,0.2)}
+.fbtn.telemetry-btn.on{color:var(--amber);border-color:rgba(255,184,77,0.4);background:rgba(255,184,77,0.1)}
+.search-box{margin-left:auto;padding:5px 12px;border-radius:7px;border:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.03);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:240px}
+.search-box:focus{border-color:rgba(77,122,255,0.3)}
+.search-box::placeholder{color:var(--text-muted)}
+
+/* Content */
+.content{padding:8px 32px 60px;position:relative;z-index:1}
+.content.hidden{display:none}
+
+/* Node cards */
+.node-grid{display:grid;grid-template-columns:1fr;gap:10px;max-width:960px}
+.node{padding:16px 20px;background:var(--glass);backdrop-filter:blur(8px);border:1px solid var(--glass-border);border-radius:12px;transition:all 0.3s;position:relative;overflow:hidden;animation:fadeUp 0.4s ease both}
+.node:hover{border-color:rgba(255,255,255,0.1);transform:translateY(-1px)}
+.node.hidden{display:none}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+.node-head{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+.node-id{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted);background:rgba(255,255,255,0.04);padding:2px 6px;border-radius:3px}
+.node-domain{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:500;text-transform:uppercase;letter-spacing:1px;padding:2px 8px;border-radius:4px}
+.node-confidence{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted);margin-left:auto}
+.node-content{font-size:13.5px;color:var(--text-dim);line-height:1.75;font-weight:300}
+
+/* Metadata pills */
+.node-pills{display:flex;gap:5px;margin-top:8px;flex-wrap:wrap}
+.meta-pill{font-family:'IBM Plex Mono',monospace;font-size:9px;padding:2px 8px;border-radius:10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.06);color:var(--text-muted);white-space:nowrap}
+.meta-pill .pill-key{color:var(--text-muted)}
+.meta-pill .pill-val{color:var(--cyan)}
+.meta-pill.pill-cost .pill-val{color:var(--amber)}
+.meta-pill.pill-model .pill-val{color:var(--violet)}
+.meta-pill.pill-kind .pill-val{color:var(--peach)}
+.meta-pill.pill-level .pill-val{color:var(--rose)}
+
+.node-meta{display:flex;gap:12px;margin-top:8px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted)}
+
+/* Domain colors */
+.domain-marketing{background:rgba(255,184,77,0.12);color:var(--amber)}
+.domain-sales{background:rgba(74,232,138,0.12);color:var(--green)}
+.domain-engineer{background:rgba(56,232,200,0.12);color:var(--cyan)}
+.domain-architect{background:rgba(77,122,255,0.12);color:var(--blue)}
+.domain-security{background:rgba(255,77,106,0.12);color:var(--rose)}
+.domain-data_analytics{background:rgba(157,106,255,0.12);color:var(--violet)}
+.domain-planner_researcher{background:rgba(255,122,92,0.12);color:var(--peach)}
+.domain-system_telemetry{background:rgba(255,184,77,0.12);color:var(--amber)}
+.domain-system{background:rgba(77,122,255,0.08);color:var(--blue)}
+.domain-unknown{background:rgba(255,255,255,0.06);color:var(--text-dim)}
+
+/* Border accents by domain */
+.border-marketing{border-left:2px solid var(--amber)}
+.border-sales{border-left:2px solid var(--green)}
+.border-engineer{border-left:2px solid var(--cyan)}
+.border-architect{border-left:2px solid var(--blue)}
+.border-security{border-left:2px solid var(--rose)}
+.border-data_analytics{border-left:2px solid var(--violet)}
+.border-planner_researcher{border-left:2px solid var(--peach)}
+.border-system_telemetry{border-left:2px solid var(--amber)}
+.border-system{border-left:2px solid var(--blue)}
+.border-unknown{border-left:2px solid var(--text-muted)}
+
+/* Empty state */
+.empty{text-align:center;padding:80px 32px;color:var(--text-muted);font-style:italic}
+
+@media(max-width:768px){
+  .header{padding:0 16px;gap:10px}
+  .filters,.content,.upload-zone,.cost-bar{padding-left:16px;padding-right:16px}
+  .stats{display:none}
+  .search-box{width:140px}
+}
+</style>
+</head>
+<body>
+<div class="ambient">
+  <div class="ambient-blob ab1"></div>
+  <div class="ambient-blob ab2"></div>
+</div>
+
+<div class="header">
+  <div class="logo">Ecphory</div>
+  <span class="logo-sub">Fabric Viewer v2</span>
+  <div class="stats" id="stats"></div>
+</div>
+
+<!-- Upload zone (shown when no data loaded) -->
+<div class="upload-zone" id="uploadZone">
+  <div class="drop-area" id="dropArea" onclick="document.getElementById('fileInput').click()">
+    <h2>Load Your Fabric</h2>
+    <p>Drop a <code>fabric.json</code> file here, or click to browse.</p>
+    <p style="margin-top:12px;font-size:11px;color:var(--text-muted)">
+      Find it at: <code>~/.ecphory/projects/{project}/fabric.json</code>
+    </p>
+  </div>
+  <input type="file" id="fileInput" accept=".json">
+  <button class="cli-btn" id="cliToggle">Load from CLI</button>
+  <div class="cli-help" id="cliHelp">
+    <h3>Pipe fabric data from the CLI</h3>
+    <pre># Export a project's fabric as JSON:
+intent fabric export --project myproject > fabric.json
+
+# Or copy the raw fabric file:
+cp ~/.ecphory/myproject/fabric.json .
+
+# Then drag fabric.json onto this viewer,
+# or click the upload area above.</pre>
+  </div>
+</div>
+
+<!-- Cost summary bar (shown when telemetry nodes present) -->
+<div class="cost-bar" id="costBar">
+  <span class="cost-label">Telemetry</span>
+  <span>Total cost: <span class="cost-val" id="costTotal">$0.00</span></span>
+  <span class="cost-detail" id="costDetail"></span>
+</div>
+
+<!-- Filters (shown after load) -->
+<div class="filters hidden" id="filterBar">
+  <button class="fbtn on" data-f="all">All</button>
+  <input type="text" class="search-box" id="searchBox" placeholder="Search nodes...">
+</div>
+
+<!-- Content -->
+<div class="content hidden" id="contentArea">
+  <div class="node-grid" id="nodeGrid"></div>
+</div>
+
+<script>
+let allNodes = [];
+let activeDomain = 'all';
+
+const fileInput = document.getElementById('fileInput');
+const dropArea = document.getElementById('dropArea');
+const uploadZone = document.getElementById('uploadZone');
+const filterBar = document.getElementById('filterBar');
+const contentArea = document.getElementById('contentArea');
+const nodeGrid = document.getElementById('nodeGrid');
+const statsEl = document.getElementById('stats');
+const searchBox = document.getElementById('searchBox');
+const costBar = document.getElementById('costBar');
+const cliToggle = document.getElementById('cliToggle');
+const cliHelp = document.getElementById('cliHelp');
+
+// CLI help toggle
+cliToggle.addEventListener('click', () => {
+  cliHelp.classList.toggle('visible');
+});
+
+// Drag and drop
+dropArea.addEventListener('dragover', e => { e.preventDefault(); dropArea.style.borderColor = 'var(--blue)'; });
+dropArea.addEventListener('dragleave', () => { dropArea.style.borderColor = ''; });
+dropArea.addEventListener('drop', e => {
+  e.preventDefault();
+  dropArea.style.borderColor = '';
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      processData(data);
+    } catch(err) {
+      alert('Error parsing JSON: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function processData(data) {
+  // Handle different fabric.json formats
+  if (Array.isArray(data)) {
+    allNodes = data;
+  } else if (data.nodes && Array.isArray(data.nodes)) {
+    allNodes = data.nodes;
+  } else if (typeof data === 'object') {
+    allNodes = Object.values(data).filter(v => v && typeof v === 'object' && (v.content || v.want));
+  }
+
+  if (allNodes.length === 0) {
+    alert('No nodes found in this file.');
+    return;
+  }
+
+  // Normalize node format
+  allNodes = allNodes.map(n => ({
+    id: n.id || n.lineage_id || 'unknown',
+    content: n.content || n.want || n.description || JSON.stringify(n).slice(0,200),
+    domain: n.domain || (n.metadata && n.metadata.domain) || (n.constraints && 'has_constraints') || 'unknown',
+    confidence: n.confidence || (n.confidence_surface && n.confidence_surface.comprehension) || null,
+    timestamp: n.timestamp || n.created_at || n.last_activated || (n.metadata && n.metadata.timestamp) || null,
+    metadata: n.metadata || {},
+    raw: n,
+  }));
+
+  // Sort by timestamp (newest first)
+  allNodes.sort((a, b) => {
+    if (a.timestamp && b.timestamp) return b.timestamp.localeCompare(a.timestamp);
+    return 0;
+  });
+
+  // Build domain filter buttons
+  const domains = [...new Set(allNodes.map(n => n.domain))].sort();
+  buildFilters(domains);
+  renderStats(domains);
+  renderCostBar();
+  renderNodes();
+
+  uploadZone.classList.add('hidden');
+  filterBar.classList.remove('hidden');
+  contentArea.classList.remove('hidden');
+}
+
+function buildFilters(domains) {
+  filterBar.querySelectorAll('.fbtn.dynamic').forEach(b => b.remove());
+  const allBtn = filterBar.querySelector('[data-f="all"]');
+
+  // Add telemetry filter if telemetry nodes exist
+  const hasTelemetry = allNodes.some(n => n.domain === 'system_telemetry');
+  if (hasTelemetry) {
+    const tBtn = document.createElement('button');
+    tBtn.className = 'fbtn dynamic telemetry-btn';
+    tBtn.dataset.f = 'system_telemetry';
+    tBtn.textContent = 'telemetry';
+    tBtn.addEventListener('click', () => {
+      filterBar.querySelectorAll('.fbtn').forEach(b => b.classList.remove('on'));
+      tBtn.classList.add('on');
+      activeDomain = 'system_telemetry';
+      renderNodes();
+    });
+    filterBar.insertBefore(tBtn, searchBox);
+  }
+
+  domains.forEach(d => {
+    if (d === 'system_telemetry') return; // already handled
+    const btn = document.createElement('button');
+    btn.className = 'fbtn dynamic';
+    btn.dataset.f = d;
+    btn.textContent = d.replace(/_/g, ' ');
+    btn.addEventListener('click', () => {
+      filterBar.querySelectorAll('.fbtn').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      activeDomain = d;
+      renderNodes();
+    });
+    filterBar.insertBefore(btn, searchBox);
+  });
+
+  allBtn.addEventListener('click', () => {
+    filterBar.querySelectorAll('.fbtn').forEach(b => b.classList.remove('on'));
+    allBtn.classList.add('on');
+    activeDomain = 'all';
+    renderNodes();
+  });
+}
+
+function renderStats(domains) {
+  const domainCounts = {};
+  allNodes.forEach(n => { domainCounts[n.domain] = (domainCounts[n.domain] || 0) + 1; });
+  statsEl.innerHTML = `
+    <span>Nodes: <span class="stat-val">${allNodes.length}</span></span>
+    <span>Domains: <span class="stat-val">${domains.length}</span></span>
+  `;
+}
+
+function renderCostBar() {
+  const telemetryNodes = allNodes.filter(n => n.domain === 'system_telemetry');
+  if (telemetryNodes.length === 0) { costBar.classList.remove('visible'); return; }
+
+  let totalCost = 0;
+  let modelCosts = {};
+  telemetryNodes.forEach(n => {
+    const cost = parseFloat(n.metadata.cost_usd) || 0;
+    totalCost += cost;
+    const model = n.metadata.model || 'unknown';
+    modelCosts[model] = (modelCosts[model] || 0) + cost;
+  });
+
+  document.getElementById('costTotal').textContent = '$' + totalCost.toFixed(4);
+
+  const details = Object.entries(modelCosts)
+    .sort((a,b) => b[1] - a[1])
+    .map(([m, c]) => `${m}: $${c.toFixed(4)}`)
+    .join('  |  ');
+  document.getElementById('costDetail').textContent = `${telemetryNodes.length} calls  |  ${details}`;
+
+  costBar.classList.add('visible');
+}
+
+// Metadata keys that get special pill styling
+const PILL_CLASSES = {
+  cost_usd: 'pill-cost', cost: 'pill-cost',
+  model: 'pill-model',
+  kind: 'pill-kind',
+  level: 'pill-level',
+};
+// Keys to skip in pill display (already shown elsewhere or too verbose)
+const SKIP_KEYS = new Set(['domain', 'timestamp', 'event_id', 'pulse_id']);
+
+function renderMetaPills(metadata) {
+  if (!metadata || typeof metadata !== 'object') return '';
+  const entries = Object.entries(metadata).filter(([k]) => !SKIP_KEYS.has(k));
+  if (entries.length === 0) return '';
+
+  const pills = entries.map(([k, v]) => {
+    const cls = PILL_CLASSES[k] || '';
+    let display = String(v);
+    if (k === 'cost_usd' || k === 'cost') display = '$' + parseFloat(v).toFixed(4);
+    if (display.length > 40) display = display.slice(0, 37) + '...';
+    return `<span class="meta-pill ${cls}"><span class="pill-key">${k}:</span> <span class="pill-val">${escapeHtml(display)}</span></span>`;
+  });
+  return `<div class="node-pills">${pills.join('')}</div>`;
+}
+
+function renderNodes() {
+  const query = searchBox.value.toLowerCase();
+  nodeGrid.innerHTML = '';
+
+  let visible = 0;
+  allNodes.forEach((n, i) => {
+    if (activeDomain !== 'all' && n.domain !== activeDomain) return;
+    if (query) {
+      const haystack = (n.content + ' ' + n.domain + ' ' + JSON.stringify(n.metadata)).toLowerCase();
+      if (!haystack.includes(query)) return;
+    }
+
+    visible++;
+    const domainSafe = n.domain.replace(/[^a-z_]/g, '');
+    const domainClass = `domain-${domainSafe}`;
+    const borderClass = `border-${domainSafe}`;
+
+    const card = document.createElement('div');
+    card.className = `node ${borderClass}`;
+    card.style.animationDelay = `${Math.min(visible * 0.03, 0.5)}s`;
+
+    let timeHTML = '';
+    if (n.timestamp) timeHTML = `<span class="node-meta">${new Date(n.timestamp).toLocaleString()}</span>`;
+
+    card.innerHTML = `
+      <div class="node-head">
+        <span class="node-id">${String(n.id).slice(0,8)}</span>
+        <span class="node-domain ${domainClass}">${n.domain}</span>
+        ${n.confidence !== null ? `<span class="node-confidence">confidence: ${(n.confidence * 100).toFixed(0)}%</span>` : ''}
+      </div>
+      <div class="node-content">${escapeHtml(n.content)}</div>
+      ${renderMetaPills(n.metadata)}
+      ${timeHTML}
+    `;
+    nodeGrid.appendChild(card);
+  });
+
+  if (visible === 0) {
+    nodeGrid.innerHTML = '<div class="empty">No nodes match your filter.</div>';
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Live search
+searchBox.addEventListener('input', renderNodes);
+</script>
+</body>
+</html>
