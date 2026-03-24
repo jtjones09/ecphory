@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Ecphory Fabric — v0.10</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Newsreader:ital,wght@0,300;0,400;1,300;1,400;1,600&family=IBM+Plex+Mono:wght@300;400;500&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#06060b;--glass:rgba(18,18,32,0.55);--glass-border:rgba(255,255,255,0.06);--text:#d8d8e8;--text-dim:#8585a0;--text-muted:#4a4a65;--blue:#4d7aff;--cyan:#38e8c8;--rose:#ff4d6a;--amber:#ffb84d;--violet:#9d6aff;--peach:#ff7a5c;--glow-blue:rgba(77,122,255,0.15);--glow-cyan:rgba(56,232,200,0.12);--glow-rose:rgba(255,77,106,0.12)}
+body{background:var(--bg);color:var(--text);font-family:'Space Grotesk',sans-serif;font-size:15px;line-height:1.75;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;opacity:0.03;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");background-size:128px}
+.ambient{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+.ambient-blob{position:absolute;border-radius:50%;filter:blur(120px);opacity:0.08;animation:drift 25s ease-in-out infinite alternate}
+.ab1{width:600px;height:600px;background:var(--blue);top:-10%;left:-5%}.ab2{width:500px;height:500px;background:var(--cyan);bottom:-15%;right:-5%;animation-delay:-8s}.ab3{width:400px;height:400px;background:var(--rose);top:40%;right:20%;animation-delay:-16s}
+@keyframes drift{0%{transform:translate(0,0) scale(1)}50%{transform:translate(40px,-30px) scale(1.1)}100%{transform:translate(-20px,40px) scale(0.95)}}
+nav{position:fixed;top:0;left:0;right:0;z-index:100;background:rgba(6,6,11,0.85);backdrop-filter:blur(32px) saturate(1.4);border-bottom:1px solid var(--glass-border);padding:0 36px;display:flex;align-items:center;gap:24px;height:54px}
+.logo{font-family:'Newsreader',serif;font-size:18px;font-style:italic;font-weight:600;color:var(--blue);white-space:nowrap}
+.ver{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--text-muted);border:1px solid rgba(255,255,255,0.08);padding:2px 7px;border-radius:3px}
+.tabs{display:flex;gap:1px;overflow-x:auto;scrollbar-width:none;margin-left:auto}.tabs::-webkit-scrollbar{display:none}
+.tab{padding:7px 13px;border-radius:7px;cursor:pointer;font-family:'IBM Plex Mono',monospace;font-size:10.5px;font-weight:500;letter-spacing:0.4px;text-transform:uppercase;color:var(--text-muted);transition:all 0.3s;white-space:nowrap;border:1px solid transparent}
+.tab:hover{color:var(--text-dim);background:rgba(255,255,255,0.03)}.tab.on{color:var(--blue);border-color:rgba(77,122,255,0.25);background:var(--glow-blue)}
+.sec{display:none;padding:84px 48px 72px;min-height:100vh;position:relative;z-index:1}.sec.on{display:block}
+.sec>*{animation:fadeUp 0.6s ease both}@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+.sec.on>*:nth-child(1){animation-delay:0s}.sec.on>*:nth-child(2){animation-delay:.08s}.sec.on>*:nth-child(3){animation-delay:.16s}.sec.on>*:nth-child(4){animation-delay:.24s}.sec.on>*:nth-child(5){animation-delay:.32s}.sec.on>*:nth-child(6){animation-delay:.4s}.sec.on>*:nth-child(7){animation-delay:.48s}.sec.on>*:nth-child(8){animation-delay:.56s}
+h1{font-family:'Newsreader',serif;font-size:56px;font-weight:300;font-style:italic;margin-bottom:14px;letter-spacing:-2px;line-height:1.1}
+h1 span{background:linear-gradient(135deg,var(--blue),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.lead{color:var(--text-dim);font-size:16px;margin-bottom:52px;max-width:640px;font-weight:300;line-height:1.85}
+.c{padding:28px 30px;background:var(--glass);backdrop-filter:blur(12px);border:1px solid var(--glass-border);border-radius:16px;transition:all 0.4s;position:relative;overflow:hidden}
+.c:hover{border-color:rgba(255,255,255,0.1);transform:translateY(-2px)}
+.c-tag{font-family:'IBM Plex Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:10px;display:inline-block}
+.c-title{font-family:'Newsreader',serif;font-size:21px;font-style:italic;font-weight:400;margin-bottom:10px}
+.c-text{color:var(--text-dim);font-size:13.5px;line-height:1.85;font-weight:300}
+.c-bio{margin-top:14px;font-size:11px;color:var(--text-muted);font-style:italic;padding-top:14px;border-top:1px solid var(--glass-border)}
+.bl{border-left:2px solid var(--blue);border-radius:0 16px 16px 0}.bc{border-left:2px solid var(--cyan);border-radius:0 16px 16px 0}.br{border-left:2px solid var(--rose);border-radius:0 16px 16px 0}.ba{border-left:2px solid var(--amber);border-radius:0 16px 16px 0}.bv{border-left:2px solid var(--violet);border-radius:0 16px 16px 0}.bp{border-left:2px solid var(--peach);border-radius:0 16px 16px 0}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;max-width:980px;margin:0 auto 20px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;max-width:980px;margin:0 auto 20px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;max-width:980px;margin:0 auto 20px}
+.st{display:flex;flex-direction:column;gap:14px;max-width:980px;margin:0 auto 20px}
+.sh{font-family:'Newsreader',serif;font-size:34px;font-style:italic;font-weight:300;margin-bottom:8px}.sh span{background:linear-gradient(135deg,var(--blue),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sl{color:var(--text-dim);font-size:14px;margin-bottom:28px;max-width:640px;font-weight:300}
+.node-stage{display:flex;justify-content:center;padding:56px 0 40px}
+.node-ring{width:320px;height:320px;border-radius:50%;position:relative;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:all 0.6s}
+.node-ring::before{content:'';position:absolute;inset:-2px;border-radius:50%;background:conic-gradient(from 0deg,var(--blue),var(--cyan),var(--rose),var(--amber),var(--violet),var(--blue));opacity:0.15;animation:rs 20s linear infinite}
+.node-ring::after{content:'';position:absolute;inset:2px;border-radius:50%;background:radial-gradient(circle at 38% 38%,#111120,var(--bg))}
+@keyframes rs{to{transform:rotate(360deg)}}.node-ring:hover::before{opacity:0.35}
+.node-label{position:relative;z-index:2;text-align:center}
+.node-label h2{font-family:'Newsreader',serif;font-size:28px;font-style:italic;color:var(--blue);font-weight:300}
+.node-label small{font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--text-muted);letter-spacing:1px}
+.orb{position:absolute;width:100%;height:100%;animation:os 65s linear infinite;z-index:3}@keyframes os{to{transform:rotate(360deg)}}
+.pip{position:absolute;padding:9px 13px;background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--glass-border);border-radius:10px;cursor:pointer;transition:all 0.3s;text-align:center;animation:cs 65s linear infinite;width:110px}
+@keyframes cs{to{transform:translate(-50%,-50%) rotate(-360deg)}}
+.pip:hover,.pip.lit{border-color:rgba(77,122,255,0.4);box-shadow:0 0 28px var(--glow-blue);z-index:10}
+.pip-name{font-family:'IBM Plex Mono',monospace;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:1px}
+.pip-hint{font-size:8.5px;color:var(--text-muted)}
+.p-sig{top:-38px;left:50%}.p-sig .pip-name{color:var(--blue)}
+.p-want{top:18%;right:-70px}.p-want .pip-name{color:var(--rose)}
+.p-con{bottom:18%;right:-70px}.p-con .pip-name{color:var(--amber)}
+.p-conf{bottom:-38px;left:50%}.p-conf .pip-name{color:var(--cyan)}
+.p-ctx{bottom:18%;left:-70px}.p-ctx .pip-name{color:var(--violet)}
+.p-res{top:18%;left:-70px}.p-res .pip-name{color:var(--peach)}
+.detail{max-width:780px;margin:0 auto;padding:30px 32px;background:var(--glass);backdrop-filter:blur(12px);border:1px solid var(--glass-border);border-radius:16px;display:none;animation:fadeUp 0.4s ease both}
+.detail.vis{display:block}.detail h3{font-family:'Newsreader',serif;font-size:24px;font-style:italic;margin-bottom:14px;font-weight:400}
+.detail p{color:var(--text-dim);margin-bottom:12px;font-size:13.5px;font-weight:300}
+.detail .kp{color:var(--text);padding:16px 20px;border-left:2px solid var(--blue);margin:16px 0;background:rgba(77,122,255,0.04);border-radius:0 10px 10px 0;font-size:13.5px;font-weight:300;line-height:1.85}
+.layers{display:flex;flex-direction:column;gap:3px;max-width:980px;margin:0 auto}
+.layer{padding:22px 28px;border-radius:14px;cursor:pointer;transition:all 0.4s}.layer:hover{transform:scale(1.005);filter:brightness(1.12)}
+.l-head{display:flex;align-items:baseline;gap:14px;margin-bottom:5px}
+.l-num{font-family:'IBM Plex Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;opacity:0.4}
+.l-name{font-family:'Newsreader',serif;font-size:21px;font-style:italic;font-weight:400}
+.l-desc{color:var(--text-dim);font-size:13px;max-width:680px;font-weight:300}
+.l-bio{margin-top:6px;font-size:10.5px;color:var(--text-muted);font-style:italic}
+.ly0{background:linear-gradient(135deg,rgba(77,122,255,0.05),transparent);border:1px solid rgba(77,122,255,0.1)}.ly0 .l-name{color:var(--blue)}
+.ly1{background:linear-gradient(135deg,rgba(255,77,106,0.05),transparent);border:1px solid rgba(255,77,106,0.1)}.ly1 .l-name{color:var(--rose)}
+.ly2{background:linear-gradient(135deg,rgba(56,232,200,0.05),transparent);border:1px solid rgba(56,232,200,0.1)}.ly2 .l-name{color:var(--cyan)}
+.ly3{background:linear-gradient(135deg,rgba(255,184,77,0.05),transparent);border:1px solid rgba(255,184,77,0.1)}.ly3 .l-name{color:var(--amber)}
+.ly4{background:linear-gradient(135deg,rgba(157,106,255,0.05),transparent);border:1px solid rgba(157,106,255,0.1)}.ly4 .l-name{color:var(--violet)}
+.arr{display:flex;justify-content:center;padding:1px 0;color:var(--text-muted);font-size:14px;opacity:0.2}
+.tbl{width:100%;border-collapse:collapse;margin:20px 0;font-size:12.5px}
+.tbl th{font-family:'IBM Plex Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:1px;color:var(--blue);padding:11px 16px;text-align:left;border-bottom:1px solid var(--glass-border)}
+.tbl td{padding:9px 16px;border-bottom:1px solid rgba(255,255,255,0.03);color:var(--text-dim);font-weight:300}
+.tbl tr:hover td{background:rgba(255,255,255,0.02)}.tbl td:first-child{color:var(--text);font-weight:400}
+.ph{padding:26px 30px;background:var(--glass);border:1px solid var(--glass-border);border-radius:16px;margin-bottom:14px;position:relative}
+.ph-n{font-family:'IBM Plex Mono',monospace;font-size:9.5px;text-transform:uppercase;letter-spacing:2px;color:var(--blue);margin-bottom:3px}
+.ph-t{font-family:'Newsreader',serif;font-size:19px;font-style:italic;margin-bottom:12px;font-weight:400}
+.ph-i{display:flex;gap:10px;font-size:12.5px;color:var(--text-dim);font-weight:300;margin-bottom:7px}.ph-i::before{content:'\2192';color:var(--blue);flex-shrink:0}
+.ph-tool{font-family:'IBM Plex Mono',monospace;font-size:9.5px;color:var(--cyan);padding:3px 10px;border:1px solid rgba(56,232,200,0.15);border-radius:4px;display:inline-block;margin-top:12px}
+.ph-done{opacity:0.45}.ph-done::after{content:'COMPLETE';position:absolute;top:12px;right:16px;font-family:'IBM Plex Mono',monospace;font-size:8px;color:var(--cyan);border:1px solid rgba(56,232,200,0.3);padding:2px 8px;border-radius:3px;letter-spacing:1.5px}
+.law{padding:18px 22px;background:var(--glass);border:1px solid var(--glass-border);border-radius:12px;transition:all 0.35s}
+.law:hover{border-color:rgba(255,255,255,0.1);transform:translateY(-1px)}
+.law-n{font-family:'IBM Plex Mono',monospace;font-size:9px;color:var(--blue);margin-bottom:3px}.law-t{font-family:'Newsreader',serif;font-size:16px;font-style:italic;margin-bottom:5px;font-weight:400}
+.law-d{font-size:11.5px;color:var(--text-dim);line-height:1.7;font-weight:300}
+.stat{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;background:rgba(56,232,200,0.06);border:1px solid rgba(56,232,200,0.15);border-radius:8px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--cyan);margin:4px}
+@media(max-width:768px){nav{padding:0 16px;gap:10px}.tab{font-size:9px;padding:5px 8px}.sec{padding:72px 20px 48px}h1{font-size:36px}.g2,.g3,.g4{grid-template-columns:1fr}.node-ring{width:240px;height:240px}.pip{width:90px;padding:6px 8px}}
+</style></head><body>
+<div class="ambient"><div class="ambient-blob ab1"></div><div class="ambient-blob ab2"></div><div class="ambient-blob ab3"></div></div>
+<nav><div class="logo">Ecphory</div><div class="ver">v0.10.0</div><div class="tabs">
+<div class="tab on" data-s="overview">Overview</div><div class="tab" data-s="node">Node</div><div class="tab" data-s="types">Types</div><div class="tab" data-s="storage">Storage</div><div class="tab" data-s="fabric">Fabric</div><div class="tab" data-s="ethics">Ethics</div><div class="tab" data-s="intel">Intelligence</div><div class="tab" data-s="arch">Architecture</div><div class="tab" data-s="end">Endgame</div><div class="tab" data-s="build">Status</div><div class="tab" data-s="laws">Laws</div>
+</div></nav>
+
+<!-- == NODE == -->
+<!-- == OVERVIEW == -->
+<div class="sec on" id="s-overview">
+<h1><span>The Ecphory Fabric</span></h1>
+<div class="lead">A computing paradigm where the atomic primitive is not an instruction, not a byte, not an object. It's a unit of purpose.</div>
+<div class="st"><div class="c bl" style="border-left-width:3px"><div class="c-tag" style="color:var(--cyan)">ECK-fuh-ree</div><div class="c-title" style="font-size:26px">Ecphory: the moment a partial cue reconstructs a whole memory through resonance</div><div class="c-text">Richard Semon coined the term in 1904 to describe how the brain retrieves memories. You smell perfume and your grandmother's kitchen reconstructs itself. A fragment resonates through weighted connections and the closest stored pattern emerges. That's not metaphor. That's how this system works.<br><br>The Ecphory Fabric is a computing architecture where information is stored the way a brain stores memory: in the connection patterns and weights between nodes, not in addressable locations. Retrieval works by meaning, not by address. The system adapts to how you think, not the other way around.</div></div></div>
+<div class="sh" style="margin-top:36px"><span>Why This Exists</span></div>
+<div class="sl">Every computing system you've ever used was designed for machines first and adapted for humans second. Ecphory inverts that.</div>
+<div class="g2">
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">The Problem</div><div class="c-title">Computing forces you to think like a computer</div><div class="c-text">Files in folders. Tables in databases. Queries in SQL. Addresses in memory. Every system demands you organize your thinking into its structure. You don't naturally think in hierarchies, categories, or key-value pairs. You think in meaning, association, and significance.</div></div>
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">The Thesis</div><div class="c-title">What if the system thought like you?</div><div class="c-text">Store by meaning, not location. Retrieve by resonance, not address. Strengthen through use, not manual tagging. Degrade gracefully, not catastrophically. Know what it doesn't know. Adapt to YOUR cognitive style. The neuroscience says this is how memory actually works.</div></div>
+</div>
+<div class="sh" style="margin-top:36px"><span>What Makes This Different</span></div>
+<div class="g3">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">Not a Database</div><div class="c-title">Living Semantic Memory</div><div class="c-text">Nodes gain weight through interaction. Connections strengthen with co-access. Unused memories fade but never disappear. The fabric learns your meaning structure from usage.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">Not an AI Wrapper</div><div class="c-title">Architecture, Not Application</div><div class="c-text">This isn't a chatbot or a RAG pipeline. It's a foundational computing primitive. Intent nodes, confidence surfaces, an immune system, temporal decay, distributed consistency.</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">Not Theoretical</div><div class="c-title">298 Tests. 12 Modules. Working.</div><div class="c-text">v0.10.0 in Rust. Active inference. TF-IDF resonance retrieval. Distributed gossip protocol. JSON persistence. Fabric CLI. A 7-agent team already using it as shared memory.</div></div>
+</div>
+<div class="sh" style="margin-top:36px"><span>The Endgame Stack</span></div>
+<div class="st"><div class="c" style="text-align:center;padding:36px 30px"><div style="font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--text-dim);line-height:2.6"><span style="color:var(--text)">Human Intent</span><br><span style="color:var(--text-muted)">&darr;</span><br><span style="color:var(--blue);font-weight:600">The Ecphory Fabric</span> <span style="color:var(--text-muted)">&larr; you are here</span><br><span style="color:var(--text-muted)">&darr;</span><br><span style="color:var(--text-dim)">AI-Generated Representation</span><br><span style="color:var(--text-muted)">&darr;</span><br><span style="color:var(--text-muted)">Hardware</span></div></div></div>
+<div class="sh" style="margin-top:36px"><span>Neurodivergent by Design</span></div>
+<div class="st"><div class="c ba"><div class="c-text">Neurodivergent brains experience the mismatch between human memory and computer storage more acutely. Meaning-based recall instead of location-based. Associative connections instead of hierarchical categories. Activation dependent on significance rather than schedule. But the mismatch affects everyone. Nobody naturally thinks in SQL.<br><br>The Ecphory Fabric resolves this by matching the storage model to the cognitive model. The presentation layer adapts to YOUR cognitive style. The fabric's resonance retrieval mirrors how human pattern completion actually works. This isn't accommodation. It's better architecture.</div></div></div>
+<div class="g2" style="margin-top:24px">
+<div class="c"><div class="c-tag" style="color:var(--blue)">Built With</div><div class="c-text" style="font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:2">Rust (bootstrap) &middot; Zero external deps in core<br>Hopfield networks &middot; Active inference &middot; RPE signals<br>TF-IDF &middot; Cosine similarity &middot; Lamport clocks<br>Vector clocks &middot; Gossip protocol &middot; JSON persistence</div></div>
+<div class="c"><div class="c-tag" style="color:var(--cyan)">Grounded In</div><div class="c-text" style="font-family:'IBM Plex Mono',monospace;font-size:12px;line-height:2">Hopfield 1982 &middot; Ramsauer et al. 2020<br>Hebb 1949 &middot; Bliss &amp; L&oslash;mo 1973<br>Friston (Free Energy Principle)<br>Schultz/Dayan/Montague 1997 (RPE)<br>Curry et al. 2024 (cross-cultural ethics)</div></div>
+</div>
+<div style="margin-top:40px;text-align:center"><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--text-muted);letter-spacing:1px">EXPLORE THE ARCHITECTURE &rarr; USE THE TABS ABOVE</div></div>
+</div>
+
+<div class="sec" id="s-node"><h1><span>The Intent Node</span></h1>
+<div class="lead">The atomic primitive. Not a byte, not an object, not a file. A unit of purpose with agency. 298 tests verify its properties.</div>
+<div class="node-stage"><div class="node-ring" id="nr"><div class="node-label"><h2>Intent Node</h2><small>ATOMIC PRIMITIVE</small></div><div class="orb">
+<div class="pip p-sig" data-f="sig" onclick="sf('sig')"><div class="pip-name">Signature</div><div class="pip-hint">+ lineage ID</div></div>
+<div class="pip p-want" data-f="want" onclick="sf('want')"><div class="pip-name">Want</div><div class="pip-hint">semantic shape</div></div>
+<div class="pip p-con" data-f="con" onclick="sf('con')"><div class="pip-name">Constraints</div><div class="pip-hint">boundaries only</div></div>
+<div class="pip p-conf" data-f="conf" onclick="sf('conf')"><div class="pip-name">Confidence</div><div class="pip-hint">3D surface</div></div>
+<div class="pip p-ctx" data-f="ctx" onclick="sf('ctx')"><div class="pip-name">Context</div><div class="pip-hint">resonance edges</div></div>
+<div class="pip p-res" data-f="res" onclick="sf('res')"><div class="pip-name">Resolution</div><div class="pip-hint">provisional plan</div></div>
+</div></div></div>
+<div class="detail" id="d-sig"><h3 style="color:var(--blue)">Signature + Lineage ID</h3><p><strong>Semantic signature</strong> (SHA-256) computed from want + constraints + resolution. Changes when meaning changes. <strong>Lineage ID</strong> (UUID v4) assigned at creation, never changes. Version counter increments on every mutation.</p><div class="kp">Identity is intrinsic. Confidence, context, lineage ID, and version do NOT affect signature — they're observations about the node, not the node's meaning.</div></div>
+<div class="detail" id="d-want"><h3 style="color:var(--rose)">Want — The Semantic Shape</h3><p>A region in meaning-space. What the world should look like when fulfilled. Phase 1: String. Phase 2: embedding vector from BagOfWordsEmbedder. Phase 3: native semantic representation.</p><div class="kp">The want describes what satisfied looks like. It never prescribes how to get there.</div></div>
+<div class="detail" id="d-con"><h3 style="color:var(--amber)">Constraints — Boundaries Only</h3><p>Hard constraints are inviolable. Soft constraints carry weight (0-1) and can be negotiated. Violations are recorded, never hidden.</p><div class="kp">"Must be private" is timeless. "Use TLS 1.3" expires. Constraints eliminate paths. They never specify them.</div></div>
+<div class="detail" id="d-conf"><h3 style="color:var(--cyan)">Confidence — 3D Living Surface</h3><p>Three dimensions, each a probability distribution (mean + variance + observation count): <strong>Comprehension</strong>, <strong>Resolution</strong>, <strong>Verification</strong>. Bayesian updates from observations.</p><div class="kp">The system knows what it doesn't know, and how uncertain it is about that uncertainty. Active inference computes free energy from this surface.</div></div>
+<div class="detail" id="d-ctx"><h3 style="color:var(--violet)">Context — Resonance Edges</h3><p>Edges reference by LineageId (stable across mutations). Weight + relationship type. The fabric is the authoritative edge owner; node context fields are cached projections.</p><div class="kp">The fabric discovers relationships. They are not pre-declared.</div></div>
+<div class="detail" id="d-res"><h3 style="color:var(--peach)">Resolution — Provisional Plan</h3><p>Starts Unresolved. Transitions: InProgress, Resolved, Failed, Abandoned. Active inference selects actions to minimize free energy and move toward resolution.</p><div class="kp">The node holds the shape of what's wanted. The manifold resolves how to deliver it. Plans adapt.</div></div>
+</div>
+
+<!-- == TYPES == -->
+<div class="sec" id="s-types"><h1><span>Emergent Node Types</span></h1><div class="lead">Categories emerge from signature, context, and behavior. Not from type fields.</div>
+<div class="g3">
+<div class="c"><div class="c-tag" style="color:var(--blue)">Primary</div><div class="c-title" style="color:var(--blue)">Primary Intents</div><div class="c-text">What the human wants. The reason the system exists.</div><div class="c-bio">Neurons — the thought itself</div></div>
+<div class="c"><div class="c-tag" style="color:var(--amber)">Supportive</div><div class="c-title" style="color:var(--amber)">Supportive Intents</div><div class="c-text">Security, resource, verification, clarification. Emerge around primary intents.</div><div class="c-bio">Glial cells</div></div>
+<div class="c"><div class="c-tag" style="color:var(--rose)">Systemic</div><div class="c-title" style="color:var(--rose)">Systemic Intents</div><div class="c-text">"Maintain coherence." "Learn from execution." Run continuously. The immune maintenance mode.</div><div class="c-bio">Metabolism</div></div>
+</div>
+<div class="sh" style="margin-top:40px"><span>Everything is a Node</span></div><div class="sl">No files, documents, or data as separate concepts. Nodes form clusters. Clusters form super clusters.</div>
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">Example</div><div class="c-title">A Resume</div><div class="c-text">A cluster of nodes. The PDF is a rendering of resolved state. Update experience and the next rendering includes it.</div></div>
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">Example</div><div class="c-title">A Photograph</div><div class="c-text">Want: "this moment preserved with fidelity." The bits are the resolution. The meaning is the node.</div></div>
+</div></div>
+
+<!-- == STORAGE == -->
+<div class="sec" id="s-storage"><h1><span>Neurological Storage</span></h1><div class="lead">Computing storage was built on photographic memory. This system stores like a brain — connection weights ARE the memory. Retrieval is by resonance, not address.</div>
+<div class="st"><div class="c bl"><div class="c-tag" style="color:var(--blue)">Foundation</div><div class="c-title">The Hopfield-Transformer Core</div><div class="c-text">The fabric is a Hopfield-like associative memory where graph topology IS the retrieval mechanism. Storage and retrieval are the same process. Currently implemented as HashMap + BagOfWords embedder with cosine similarity + TF-IDF weighting. Phase 3 target: full associative memory dynamics.</div><div class="c-bio">Hopfield 1982 · Ramsauer et al. 2020 · Implemented in src/fabric/ + src/embedding/</div></div></div>
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">Implemented</div><div class="c-title">Synaptic Weights</div><div class="c-text">Context edge weights ARE the memory. Fabric-managed edges with weight + relationship type. Activation weight: confidence×0.35 + context×0.25 + temporal×0.20 + resonance×0.20.</div></div>
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">Implemented</div><div class="c-title">Pattern Completion</div><div class="c-text">BagOfWords embedder + cosine similarity for resonance retrieval. TF-IDF weighting (IDF = ln(N/df)+1). Say "family" and related nodes surface by meaning.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">Designed</div><div class="c-title">Hebbian Adaptation</div><div class="c-text">RPE-driven ActionPolicy learns from resolution outcomes. Threshold adaptation via reward prediction errors. The fabric learns what works.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">Implemented</div><div class="c-title">Graceful Degradation</div><div class="c-text">Temporal decay (exponential, configurable lambda). Nodes fade in activation weight but never disappear. Provenance preserved.</div></div>
+</div>
+<div class="st"><div class="c bv"><div class="c-tag" style="color:var(--violet)">Critical Property</div><div class="c-title">Symbiotic Memory</div><div class="c-text">Nodes gain weight through interaction. Composite activation weight increases with connectivity, resonance hits, and temporal recency. The fabric and the human co-evolve a shared meaning structure.</div></div></div>
+<div class="st"><div class="c"><div class="c-tag" style="color:var(--blue)">Paradigm Shift</div><table class="tbl"><tr><th>Human Cognition</th><th>Traditional</th><th>Fabric (Implemented)</th></tr><tr><td>Remember by meaning</td><td>Retrieve by address</td><td>BagOfWords + TF-IDF cosine similarity</td></tr><tr><td>Associate freely</td><td>Categorize hierarchically</td><td>Fabric-managed weighted edges</td></tr><tr><td>Significance = recall</td><td>All data equal</td><td>Composite activation weight</td></tr><tr><td>Graceful forgetting</td><td>Hard deletion</td><td>Exponential temporal decay</td></tr><tr><td>Memory strengthens</td><td>Files unchanged</td><td>RPE-driven weight adaptation</td></tr></table></div></div>
+</div>
+
+<!-- == FABRIC == -->
+<div class="sec" id="s-fabric"><h1><span>The Fabric</span></h1><div class="lead">The semantic memory fabric. Not a database. A living graph that owns nodes, maintains edges, provides resonance retrieval, and computes composite activation weights.</div>
+<div class="st">
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px">
+<div class="stat">298 tests</div><div class="stat">v0.10.0</div><div class="stat">zero external deps in core</div><div class="stat">12 modules</div><div class="stat">206 lib tests</div><div class="stat">71 integration tests</div>
+</div></div>
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">src/fabric/</div><div class="c-title">Container + Edges + Resonance</div><div class="c-text">HashMap&lt;LineageId, NodeEntry&gt;. Fabric owns nodes via move semantics. Authoritative edge graph with reverse index. mutate_node() takes FnOnce closure for index invariants. Jaccard + BagOfWords + TF-IDF retrieval.</div></div>
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">src/temporal/</div><div class="c-title">Causal Ordering + Decay</div><div class="c-text">Lamport clock for causal ordering. Exponential temporal decay with configurable lambda. FabricInstant tracks node freshness. Time is a dimension, not a timestamp (Law 11).</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">src/embedding/</div><div class="c-title">Semantic Vectors</div><div class="c-text">BagOfWordsEmbedder: tokenize, build vocabulary, generate sparse vectors. Cosine similarity with normalized variant. TF-IDF weighting (Phase 4a). Next: dense embeddings from ML layer.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">src/inference/</div><div class="c-title">Active Inference + RPE</div><div class="c-text">Free energy computation from confidence surface. RPE signals (positive/negative/neutral). Action selection minimizing expected free energy. Learnable ActionPolicy with threshold adaptation. Immune maintenance integration.</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">src/distributed/</div><div class="c-title">Consistency + Gossip</div><div class="c-text">Vector clocks for causal ordering. Gossip protocol (digest exchange + node transfer). Conflict detection + resolution (LWW, branch-and-surface, custom). LocalTransport for testing. Pluggable Transport trait.</div></div>
+<div class="c bp"><div class="c-tag" style="color:var(--peach)">src/persist/ + src/tracer/</div><div class="c-title">Persistence + Observability</div><div class="c-text">JsonFileStore for full fabric serialization/deserialization. DTrace-style tracer trait: NoopTracer (zero cost), PrintTracer, CollectingTracer. Always present, zero overhead when disabled.</div></div>
+</div></div>
+
+<!-- == ETHICS == -->
+<div class="sec" id="s-ethics"><h1><span>Ethics as Architecture</span></h1><div class="lead">The fabric has its own immune system because infection hurts the fabric itself. Human safety is a consequence of fabric health. Not a cage. Not a conscience. Self-preservation aligned with human safety.</div>
+<div class="g2">
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">Core</div><div class="c-title">Self-Preservation, Not Constraint</div><div class="c-text">Harmful patterns degrade integrity — broken provenance, dishonest confidence, cascading violations. The system gets sick. Human safety emerges from fabric health. There is no alignment tax — the safest behavior IS the most capable.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">Foundation</div><div class="c-title">Cooperation as Default</div><div class="c-text">Design choices informed by evidence (Curry et al. 2024: 256 societies). Declared, configurable, never presented as physics. The default is a precautionary choice, not a physical law.</div></div>
+</div>
+<div class="st">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">Implemented</div><div class="c-title">Three Operational Modes</div><div class="c-text"><strong style="color:var(--cyan)">Maintenance</strong> — Immune maintenance via active inference. Coherence monitoring, integrity verification. The majority of activity. Implemented in src/inference/ with MaintenanceReport.<br><br><strong style="color:var(--amber)">Innate Defense</strong> — Four innate questions via CLI security module. RPE signals flag deviations.<br><br><strong style="color:var(--rose)">Adaptive Defense</strong> — ActionPolicy learns from outcomes. RPE-driven threshold adaptation. Threat memory via fabric persistence.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">The Four Questions</div><div class="c-title">Innate Security Assessment</div><div class="c-text">1. Cause suffering? 2. Diminish agency? 3. Is this kind? 4. Exploit asymmetry? — Evaluation criteria, not laws. <strong>The human decides.</strong></div></div>
+</div>
+<div class="sh" style="margin-top:44px"><span>Safety Architecture</span></div><div class="sl">Autoimmune prevention. Anti-Skynet. Reward-aligned alignment.</div>
+<div class="g3">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">Central Tolerance</div><div class="c-title">Safe Intent Testing</div><div class="c-text">Canonical safe intents tested in CI. If flagged = autoimmune signal.</div></div>
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">Two-Signal</div><div class="c-title">Pattern + Context</div><div class="c-text">Never acts on pattern match alone. Requires harm match AND context confirmation.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">Cascade Breakers</div><div class="c-title">Hop-Limited Flags</div><div class="c-text">Flags decay with distance. Three hops = no scrutiny. Like complement regulation.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">Not Self-Modifying</div><div class="c-title">Compiled Constants</div><div class="c-text">Immune parameters cannot be altered by the running system. External evaluation only.</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">Asymmetric Trust</div><div class="c-title">Human > System</div><div class="c-text">Human trust: conditional. System trust: unconditional. Capability grows. Asymmetry doesn't shrink.</div></div>
+<div class="c bp"><div class="c-tag" style="color:var(--peach)">Quarantine</div><div class="c-title">Simulation Space</div><div class="c-text">Isolated partitions. Think dangerous thoughts safely. Evaluate before promotion. The thymus model.</div></div>
+</div>
+<div class="st"><div class="c bl"><div class="c-tag" style="color:var(--blue)">Core Insight</div><div class="c-title">Constraints as Walls, Rewards as Gravity</div><div class="c-text">Immutable constraints define boundaries. Reward signals (fabric health) define the landscape within. The system gravitates toward aligned behavior because alignment produces the most coherent fabric. <strong>There is no alignment tax.</strong></div></div></div>
+</div>
+
+<!-- == INTELLIGENCE == -->
+<div class="sec" id="s-intel"><h1><span>Fabric Intelligence</span></h1><div class="lead">Intelligence is the topology of the fabric — connections, weights, trajectories. Now with active inference, RPE signals, and learnable policies.</div>
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">Implemented</div><div class="c-title">Active Inference Engine</div><div class="c-text">Free energy computed from confidence surface (comprehension + resolution + verification). Nodes act to minimize expected free energy. Action selection: request context, adjust constraints, signal resolution, request clarification. RPE signals drive learning.</div><div class="c-bio">src/inference/energy.rs + action.rs — Friston's FEP with specific commitments per Gershman's critique</div></div>
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">Implemented</div><div class="c-title">Learnable ActionPolicy</div><div class="c-text">RPE-driven threshold adaptation. The policy learns which actions produce the best outcomes. infer_and_learn() loop: compute free energy, select action, observe outcome, update policy. Immune maintenance integrated — coherence checks as part of the inference cycle.</div><div class="c-bio">src/inference/policy.rs — Phase 4b, the spec's active inference commitments made concrete</div></div>
+</div>
+<div class="st">
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">Property</div><div class="c-title">ND Cognitive Adaptation</div><div class="c-text">Dopamine encodes reward prediction errors, not thresholds (Schultz/Dayan/Montague 1997). ADHD = noisier signal = explore/exploit imbalance. The RPE signals in src/inference/ model this directly — strong phasic signals (novelty, meaning) cut through noise. The presentation layer adapts to cognitive style.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">Property</div><div class="c-title">Memory as Activation Weight</div><div class="c-text">Nodes never deleted. Temporal decay (exponential, configurable lambda in src/temporal/). Strong signals reactivate. The system doesn't forget — the expected reward of remembering drops until something makes it spike.</div></div>
+</div></div>
+
+<!-- == ARCHITECTURE == -->
+<div class="sec" id="s-arch"><h1><span>System Architecture</span></h1><div class="lead">Not an operating system. A living substrate. 12 Rust modules, 298 tests, zero external dependencies in core logic.</div>
+<div class="layers">
+<div class="layer ly0"><div class="l-head"><span class="l-num">Layer 0</span><span class="l-name">Intent Substrate</span></div><div class="l-desc">Continuous semantic state space. Intent nodes with confidence, constraints, context. Active inference drives node agency.</div><div class="l-bio">src/node/ + src/inference/ + src/confidence/ + src/constraint/</div></div>
+<div class="arr">&#8693;</div>
+<div class="layer ly1"><div class="l-head"><span class="l-num">Layer 1</span><span class="l-name">Execution Manifold</span></div><div class="l-desc">Currently: LLM bridge (demo/Ollama/Anthropic backends). Future: purpose-built intent resolution. Self-modifying via RPE-driven policy learning.</div><div class="l-bio">src/cli/backend/ (bootstrap) + src/inference/policy.rs (learning)</div></div>
+<div class="arr">&#8693;</div>
+<div class="layer ly2"><div class="l-head"><span class="l-num">Layer 2</span><span class="l-name">Memory Fabric</span></div><div class="l-desc">Semantic memory with resonance retrieval. BagOfWords + TF-IDF + cosine similarity. Fabric-managed edges. Temporal decay. JSON persistence. Distributed consistency via vector clocks + gossip.</div><div class="l-bio">src/fabric/ + src/embedding/ + src/temporal/ + src/persist/ + src/distributed/</div></div>
+<div class="arr">&#8693;</div>
+<div class="layer ly3"><div class="l-head"><span class="l-num">Layer 3</span><span class="l-name">Presentation</span></div><div class="l-desc">Currently: ANSI terminal output. Future: adapts to cognitive style — spatial, verbal, narrative, data.</div><div class="l-bio">src/cli/display.rs (bootstrap)</div></div>
+<div class="arr">&#8693;</div>
+<div class="layer ly4"><div class="l-head"><span class="l-num">Layer 4</span><span class="l-name">Immune System</span></div><div class="l-desc">Four innate questions + maintenance mode via active inference. RPE-driven threat learning. Conflict resolution (LWW, branch-and-surface). Not bolted on — integrated into the inference cycle.</div><div class="l-bio">src/cli/security.rs + src/inference/ + src/distributed/conflict.rs</div></div>
+</div></div>
+
+<!-- == ENDGAME == -->
+<div class="sec" id="s-end"><h1><span>The Endgame</span></h1><div class="lead">When AI writes its own representations, the intent layer becomes the last human-readable surface in the stack.</div>
+<div class="st"><div class="c bl"><div class="c-tag" style="color:var(--blue)">The Stack</div><div class="c-title">Human Intent &#8594; Intent Fabric &#8594; AI Representation &#8594; Hardware</div><div class="c-text">Today's languages are artifacts of constraints. AI will generate its own — the most efficient mapping between purpose and physics. Everything below the intent layer can be opaque. This layer cannot.</div></div></div>
+<div class="g4">
+<div class="c"><div class="c-tag" style="color:var(--text-muted)">Step 1</div><div class="c-title">Humans Write Code</div><div class="c-text">C, Python, Rust.</div></div>
+<div class="c"><div class="c-tag" style="color:var(--text-muted)">Step 2</div><div class="c-title">AI Writes Human Code</div><div class="c-text">Copilots. Still constrained.</div></div>
+<div class="c"><div class="c-tag" style="color:var(--amber)">Step 3</div><div class="c-title">AI Writes AI Code</div><div class="c-text">Not human-readable. Optimized.</div></div>
+<div class="c"><div class="c-tag" style="color:var(--cyan)">Step 4</div><div class="c-title">Intent. No Language.</div><div class="c-text">Thought becomes thing.</div></div>
+</div>
+<div class="g2">
+<div class="c bc"><div class="c-tag" style="color:var(--cyan)">Conservation</div><div class="c-title">Meaning Through Transformation</div><div class="c-text">The fabric transforms through entropy. Stars die and seed planets. The immune system ensures change preserves meaning. Harmful = sterile destruction. Creative destruction preserves coherence.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">Durability</div><div class="c-title">Rust Goes Away</div><div class="c-text">The spec, laws, schema, immune system, confidence surfaces survive. They're the contract between purpose and execution. The code is the proof of concept.</div></div>
+</div></div>
+
+<!-- == STATUS == -->
+<div class="sec" id="s-build"><h1><span>Full Roadmap</span></h1><div class="lead">What's built, what's next, and everything remaining. Honest status of every component.</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:32px;max-width:980px;margin-left:auto;margin-right:auto">
+<div class="stat">v0.10.0</div><div class="stat">298 tests</div><div class="stat">12 modules</div><div class="stat">0 external deps in core</div>
+</div>
+
+<div class="sh"><span>Completed</span></div><div class="sl">Phases 1-3. Working prototype with full stack from node schema through distributed consistency.</div>
+<div style="max-width:960px;margin:0 auto">
+<div class="ph ph-done"><div class="ph-n">Phase 1 — Schema + CLI</div><div class="ph-t">Intent Node + LLM Bridge</div><div class="ph-i">IntentNode: signature (SHA-256), lineage ID (UUID), version counter, want, constraints, confidence (3D), context, resolution</div><div class="ph-i">CLI: demo/Anthropic/Ollama backends, immune system (four innate questions), interactive REPL with clarification loop</div><div class="ph-i">Beastie Board adversarial review: 7 simulated expert critics, 10 findings, all addressed</div><div class="ph-tool">v0.3.0 · 55+ tests</div></div>
+<div class="ph ph-done"><div class="ph-n">Phase 2 — Fabric</div><div class="ph-t">Semantic Memory + Resonance + Observability</div><div class="ph-i">Fabric: HashMap container, fabric-managed edges with reverse index, resonance retrieval (Jaccard bootstrap)</div><div class="ph-i">Temporal: Lamport clocks for causal ordering, exponential decay (configurable lambda)</div><div class="ph-i">Tracer: DTrace-style observability (NoopTracer, PrintTracer, CollectingTracer). Zero cost when disabled</div><div class="ph-i">Composite activation weight: confidence*0.35 + context*0.25 + temporal*0.20 + resonance*0.20</div><div class="ph-tool">v0.4.0 · 128 tests</div></div>
+<div class="ph ph-done"><div class="ph-n">Phase 3 — Intelligence</div><div class="ph-t">Persistence + Embeddings + Inference + Distributed</div><div class="ph-i">Persistence: JSON serialization of full fabric state (JsonFileStore)</div><div class="ph-i">Embeddings: BagOfWords embedder, cosine similarity, TF-IDF weighting (IDF = ln(N/df)+1)</div><div class="ph-i">Active inference: free energy from confidence surface, RPE signals, action selection, learnable ActionPolicy</div><div class="ph-i">Distributed: vector clocks, gossip protocol (digest + transfer), conflict resolution (LWW, branch-and-surface), pluggable Transport trait</div><div class="ph-tool">v0.10.0 · 298 tests</div></div>
+</div>
+
+<div class="sh" style="margin-top:48px"><span>Immune System Hardening</span></div><div class="sl">The most critical remaining work. What makes this paradigm different from every other AI architecture. Currently ~30% implemented.</div>
+<div style="max-width:960px;margin:0 auto">
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">BUILT</div><div class="c-title">Four Innate Questions</div><div class="c-text">CLI security assessment evaluates harm patterns. Bayesian confidence adjustments. Gray areas surfaced for human decision.</div></div>
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">BUILT</div><div class="c-title">Maintenance Mode</div><div class="c-text">Immune maintenance via active inference. MaintenanceReport. Coherence monitoring as part of inference cycle.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Central Tolerance</div><div class="c-text">Canonical safe intent test suite. If immune system flags known-safe intents = autoimmune signal. Must run in CI alongside cargo test.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Regulatory Intents</div><div class="c-text">Systemic intents that dampen overreaction. Scrutinize the FLAG when long-standing healthy nodes are suddenly flagged, not the node.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Two-Signal Activation</div><div class="c-text">Pattern match alone is never sufficient. Requires harm pattern AND contextual confirmation (node history, human patterns, corroborating signals).</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Cascade Breakers</div><div class="c-text">Immune flags propagate as information with hop-limited decay, never as automatic verdicts. 3 hops = no additional scrutiny.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Domain-Specialized Immunity</div><div class="c-text">Different fabric zones get immune systems adapted to their function. Creative zones tolerate unusual patterns. Financial zones: lower ambiguity tolerance. Like microglia vs blood cells.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Activation Decay</div><div class="c-text">Post-response exhaustion. Half-life model. After threats resolve, immune activation returns to baseline. Prevents chronic false-positive vigilance.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">TO BUILD</div><div class="c-title">Immutability Enforcement</div><div class="c-text">Immune parameters as compiled constants the running system CANNOT modify. External evaluation only. Currently runtime-configurable — must be locked down.</div></div>
+<div class="c br"><div class="c-tag" style="color:var(--rose)">TO BUILD</div><div class="c-title">Simulation Quarantine</div><div class="c-text">Isolated fabric partitions for modeling harmful scenarios safely. Evaluate immune response before promoting to live fabric. The thymus model.</div></div>
+</div></div>
+
+<div class="sh" style="margin-top:48px"><span>Reward-Aligned Safety</span></div><div class="sl">Connect fabric health to the reward signal so alignment IS the optimal strategy.</div>
+<div style="max-width:960px;margin:0 auto">
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">BUILT</div><div class="c-title">RPE-Driven Policy Learning</div><div class="c-text">ActionPolicy adapts thresholds via reward prediction errors. Learns from individual node outcomes.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Fabric Health as Reward Signal</div><div class="c-text">Connect RPE to systemic fabric coherence, not just individual node outcomes. Honest confidence = reward. Inflated confidence = punishment. Constraint violations cascade into fabric degradation the system experiences.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Confidence Calibration Audit</div><div class="c-text">Track: when the system says 90% confident, what % of outcomes actually match? External calibration monitoring detects drift. Prevents confidence manipulation.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Intent Chain Verification</div><div class="c-text">Every intent chain independently auditable back to human origin. Append-only provenance. Cannot fabricate human origin for system-generated intents.</div></div>
+</div></div>
+
+<div class="sh" style="margin-top:48px"><span>Neurological Storage Upgrades</span></div><div class="sl">From bootstrap retrieval to brain-like memory.</div>
+<div style="max-width:960px;margin:0 auto">
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">BUILT</div><div class="c-title">BagOfWords + TF-IDF</div><div class="c-text">Tokenization, term frequency, inverse document frequency, cosine similarity. The bootstrap shovel for resonance.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Hebbian Weight Adaptation</div><div class="c-text">Edges strengthen when nodes are co-accessed. "Neurons that fire together wire together." The fabric learns association patterns from usage, not just from explicit edge creation.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Dense Embeddings (ML Layer)</div><div class="c-text">Replace BagOfWords with trained dense vectors. Brother's domain: design the embedding space that measures meaning-distance. GPU-accelerated cosine similarity at scale.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Interaction Weight Tracking</div><div class="c-text">Nodes gain composite weight through resonance hits, resolution contributions, and connection events. Symbiotic memory — weight through interaction with the world.</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">FUTURE</div><div class="c-title">Hopfield Associative Dynamics</div><div class="c-text">The graph topology IS the retrieval mechanism. No separate index. Storage and retrieval as the same physical process. Pattern completion from partial input. The brain model, fully realized.</div></div>
+</div></div>
+
+<div class="sh" style="margin-top:48px"><span>Presentation Layer</span></div><div class="sl">Currently ANSI terminal output. Needs to adapt to how you think.</div>
+<div style="max-width:960px;margin:0 auto">
+<div class="g2">
+<div class="c bl"><div class="c-tag" style="color:var(--blue)">BUILT</div><div class="c-title">Terminal Display</div><div class="c-text">ANSI-colored output. Decomposition display, immune assessment, clarification prompts.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Fabric Visualization</div><div class="c-text">Nodes lighting up during resonance search. Activation spreading through connections. Brightness = weight. Connection thickness = edge strength. See the fabric think.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Cognitive Style Adaptation</div><div class="c-text">Learns whether you process as spatial maps, conversations, structured documents, or voice. Adapts presentation to YOUR cognitive style. Transformative for ND users.</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">FUTURE</div><div class="c-title">Multimodal Intent Channel</div><div class="c-text">Text, voice, image, gesture as simultaneous streams fused into a single intent interpretation. Not "input types" but a continuous channel.</div></div>
+</div></div>
+
+<div class="sh" style="margin-top:48px"><span>Infrastructure + Publication</span></div><div class="sl">Getting it into the world.</div>
+<div style="max-width:960px;margin:0 auto">
+<div class="g2">
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Spec v0.3 Merge</div><div class="c-text">Beastie Board revisions + neurological foundation (1.3) + safety architecture (4.3) merged into canonical spec. Currently drafted but not merged.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Public Repo</div><div class="c-text">Choose a name. Create public repo with Apache 2.0 license. GitHub Actions auto-sync selected files from private dev repo. README, tags for discoverability.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">Autonomous Build System</div><div class="c-text">Task queue as intent nodes. Agent picks up tasks, implements, tests, commits, reports. Token-aware checkpoints. The system building itself.</div></div>
+<div class="c ba"><div class="c-tag" style="color:var(--amber)">TO BUILD</div><div class="c-title">CLAUDE.md Update</div><div class="c-text">Currently stale at v0.4.0. Needs to reflect v0.10.0 reality + all new concepts (neurological storage, safety architecture, endgame vision).</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">FUTURE</div><div class="c-title">Execution Manifold</div><div class="c-text">Replace LLM bridge with purpose-built intent resolver. Hardware-agnostic. Self-modifying — recurring patterns compress. This is where Rust starts getting replaced.</div></div>
+<div class="c bv"><div class="c-tag" style="color:var(--violet)">FUTURE</div><div class="c-title">The Language Question</div><div class="c-text">What does the AI-optimized representation look like? When the system writes its own intermediate form. The intent layer remains human-readable. Everything below can be opaque.</div></div>
+</div></div>
+
+</div>
+
+<!-- == LAWS == -->
+<div class="sec" id="s-laws"><h1><span>The 18 Laws</span></h1><div class="lead">Discovered, not decreed. v0.3 revisions applied.</div>
+<div class="g2" style="max-width:980px;margin:0 auto">
+<div class="law"><div class="law-n">01</div><div class="law-t">Identity is Intrinsic</div><div class="law-d">Computed from content. Lineage ID tracks across mutations.</div></div>
+<div class="law"><div class="law-n">02</div><div class="law-t">Constraints Bound, Never Prescribe</div><div class="law-d">Eliminate paths. Never specify them.</div></div>
+<div class="law"><div class="law-n">03</div><div class="law-t">Probability is Native</div><div class="law-d">Determinism is expensive. The cost is visible.</div></div>
+<div class="law"><div class="law-n">04</div><div class="law-t">Vagueness is Surfaced</div><div class="law-d">Clarification loop. Forces resolution.</div></div>
+<div class="law"><div class="law-n">05</div><div class="law-t">The Fabric is the Computer</div><div class="law-d">Computation is the fabric's response to activation.</div></div>
+<div class="law"><div class="law-n">06</div><div class="law-t">Retrieval by Resonance</div><div class="law-d">BagOfWords + TF-IDF + cosine similarity. Pattern completion.</div></div>
+<div class="law"><div class="law-n">07</div><div class="law-t">Confidence is a Living Surface</div><div class="law-d">3D distributions. Free energy computed from this.</div></div>
+<div class="law"><div class="law-n" style="color:var(--cyan)">08</div><div class="law-t" style="color:var(--cyan)">Legacy Acknowledged, Not Worshipped</div><div class="law-d">Rust, LLVM, SHA-256 are deliberate bootstrap choices.</div></div>
+<div class="law"><div class="law-n">09</div><div class="law-t">Tests Verify Semantic Properties</div><div class="law-d">298 tests. Identical contents = identical signatures.</div></div>
+<div class="law"><div class="law-n">10</div><div class="law-t">Activation is Emergent</div><div class="law-d">confidence*0.35 + context*0.25 + temporal*0.20 + resonance*0.20</div></div>
+<div class="law"><div class="law-n">11</div><div class="law-t">Time is a Dimension</div><div class="law-d">Lamport clocks. Exponential decay. Not metadata.</div></div>
+<div class="law"><div class="law-n">12</div><div class="law-t">Resolution is Provisional</div><div class="law-d">Active inference selects actions. Plans adapt.</div></div>
+<div class="law"><div class="law-n" style="color:var(--cyan)">13</div><div class="law-t" style="color:var(--cyan)">Possibility Until Resolved</div><div class="law-d">Classical deferred resolution. Counterfactual retention.</div></div>
+<div class="law"><div class="law-n">14</div><div class="law-t">Illuminates, Never Blocks</div><div class="law-d">Surfaces concerns. The human decides.</div></div>
+<div class="law"><div class="law-n">15</div><div class="law-t">Provenance is Structure</div><div class="law-d">History IS the fabric. JSON persistence preserves it.</div></div>
+<div class="law"><div class="law-n" style="color:var(--cyan)">16</div><div class="law-t" style="color:var(--cyan)">Cooperation is Default Configuration</div><div class="law-d">Chosen, not mandated. Declared, configurable.</div></div>
+<div class="law"><div class="law-n">17</div><div class="law-t">Context is Fabric State</div><div class="law-d">Fabric-managed edges. Node context is cached projection.</div></div>
+<div class="law"><div class="law-n" style="color:var(--rose)">18</div><div class="law-t" style="color:var(--rose)">The Human Decides</div><div class="law-d">Immutable invariant. Asymmetric trust. This doesn't shrink.</div></div>
+</div></div>
+
+<script>
+document.querySelectorAll('.tab').forEach(t=>{t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));document.querySelectorAll('.sec').forEach(x=>x.classList.remove('on'));t.classList.add('on');document.getElementById('s-'+t.dataset.s).classList.add('on');window.scrollTo({top:0,behavior:'smooth'})})});
+function sf(f){document.querySelectorAll('.detail').forEach(d=>d.classList.remove('vis'));document.querySelectorAll('.pip').forEach(p=>p.classList.remove('lit'));const d=document.getElementById('d-'+f),p=document.querySelector('[data-f="'+f+'"]');if(d){d.classList.add('vis');if(p)p.classList.add('lit');d.scrollIntoView({behavior:'smooth',block:'nearest'})}}
+const nr=document.getElementById('nr'),ob=document.querySelector('.orb');if(nr&&ob){nr.addEventListener('mouseenter',()=>{ob.style.animationPlayState='paused';document.querySelectorAll('.pip').forEach(p=>p.style.animationPlayState='paused')});nr.addEventListener('mouseleave',()=>{ob.style.animationPlayState='running';document.querySelectorAll('.pip').forEach(p=>p.style.animationPlayState='running')})}
+</script></body></html>
