@@ -3,7 +3,7 @@
 // End-to-end tests that save and load fabrics through the full pipeline.
 // These test the persistence system as a whole, not individual conversions.
 
-use intent_node::*;
+use ecphory::*;
 use std::fs;
 
 fn temp_path(name: &str) -> String {

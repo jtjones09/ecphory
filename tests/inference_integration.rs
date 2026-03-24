@@ -7,7 +7,7 @@
 // - Immune maintenance detects anomalies
 // - Inference + persistence round-trip
 
-use intent_node::*;
+use ecphory::*;
 
 #[test]
 fn fabric_free_energy_computable() {
@@ -218,15 +218,15 @@ fn verify_signature_after_mutation() {
 #[test]
 fn rpe_signal_types() {
     // Positive surprise
-    let burst = intent_node::inference::compute_rpe(1.0, 0.3, 0.3, 0.9, 0.1);
+    let burst = ecphory::inference::compute_rpe(1.0, 0.3, 0.3, 0.9, 0.1);
     assert!(matches!(burst, RPESignal::PhasicBurst(_)));
 
     // Negative surprise
-    let dip = intent_node::inference::compute_rpe(-1.0, 0.3, 0.3, 0.9, 0.1);
+    let dip = ecphory::inference::compute_rpe(-1.0, 0.3, 0.3, 0.9, 0.1);
     assert!(matches!(dip, RPESignal::Dip(_)));
 
     // Expected outcome
-    let baseline = intent_node::inference::compute_rpe(0.3, 0.3, 0.0, 0.9, 0.1);
+    let baseline = ecphory::inference::compute_rpe(0.3, 0.3, 0.0, 0.9, 0.1);
     assert!(matches!(baseline, RPESignal::Baseline(_)));
 }
 

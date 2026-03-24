@@ -3,7 +3,7 @@
 // End-to-end tests that span multiple modules.
 // These test the fabric as a system, not individual components.
 
-use intent_node::*;
+use ecphory::*;
 
 #[test]
 fn end_to_end_fabric_workflow() {

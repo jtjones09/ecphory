@@ -11,11 +11,13 @@
 
 use serde::{Serialize, Deserialize};
 
+use std::collections::HashMap;
+
 use crate::confidence::{ConfidenceSurface, Distribution};
 use crate::constraint::{Constraint, ConstraintField, ConstraintKind};
 use crate::context::RelationshipKind;
 use crate::fabric::Fabric;
-use crate::node::{IntentNode, ResolutionTarget};
+use crate::node::{IntentNode, MetadataValue, ResolutionTarget};
 use crate::signature::LineageId;
 
 use super::PersistError;
@@ -48,6 +50,18 @@ pub struct SerialNodeEntry {
     pub confidence: SerialConfidenceSurface,
     pub resolution: SerialResolutionTarget,
     pub lamport_ts: u64,
+    /// Arbitrary metadata. Absent in pre-metadata files — serde(default) handles backward compat.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata: HashMap<String, SerialMetadataValue>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", content = "value")]
+pub enum SerialMetadataValue {
+    String(String),
+    Float(f64),
+    Int(i64),
+    Bool(bool),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -151,6 +165,10 @@ impl SerialFabric {
 
 impl SerialNodeEntry {
     fn from_node(node: &IntentNode, lamport_ts: u64) -> Self {
+        let metadata = node.metadata.iter()
+            .map(|(k, v)| (k.clone(), SerialMetadataValue::from_value(v)))
+            .collect();
+
         SerialNodeEntry {
             lineage_id: node.lineage_id().as_uuid().to_string(),
             version: node.version(),
@@ -162,6 +180,7 @@ impl SerialNodeEntry {
             confidence: SerialConfidenceSurface::from_surface(&node.confidence),
             resolution: SerialResolutionTarget::from_target(&node.resolution),
             lamport_ts,
+            metadata,
         }
     }
 
@@ -191,6 +210,11 @@ impl SerialNodeEntry {
 
         // Restore resolution.
         node.resolution = self.resolution.to_target()?;
+
+        // Restore metadata.
+        node.metadata = self.metadata.into_iter()
+            .map(|(k, v)| (k, v.into_value()))
+            .collect();
 
         // Recompute signature to match the restored content.
         // This calls recompute_signature which also bumps version,
@@ -323,6 +347,26 @@ impl SerialResolutionTarget {
             other => Err(PersistError::DeserializationError(
                 format!("Unknown resolution state: {}", other)
             )),
+        }
+    }
+}
+
+impl SerialMetadataValue {
+    fn from_value(v: &MetadataValue) -> Self {
+        match v {
+            MetadataValue::String(s) => SerialMetadataValue::String(s.clone()),
+            MetadataValue::Float(f) => SerialMetadataValue::Float(*f),
+            MetadataValue::Int(i) => SerialMetadataValue::Int(*i),
+            MetadataValue::Bool(b) => SerialMetadataValue::Bool(*b),
+        }
+    }
+
+    fn into_value(self) -> MetadataValue {
+        match self {
+            SerialMetadataValue::String(s) => MetadataValue::String(s),
+            SerialMetadataValue::Float(f) => MetadataValue::Float(f),
+            SerialMetadataValue::Int(i) => MetadataValue::Int(i),
+            SerialMetadataValue::Bool(b) => MetadataValue::Bool(b),
         }
     }
 }
@@ -589,5 +633,64 @@ mod tests {
         };
         let result = sf.into_fabric();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn serial_node_with_metadata_roundtrip() {
+        use crate::node::MetadataValue;
+        let mut node = IntentNode::new("API call to marketing");
+        node.metadata.insert("cost".into(), MetadataValue::Float(0.42));
+        node.metadata.insert("model".into(), MetadataValue::String("sonnet".into()));
+        node.metadata.insert("tokens".into(), MetadataValue::Int(1500));
+        node.metadata.insert("success".into(), MetadataValue::Bool(true));
+
+        let sn = SerialNodeEntry::from_node(&node, 10);
+        let (node2, _) = sn.into_node().unwrap();
+
+        assert_eq!(node2.metadata.get("cost"), Some(&MetadataValue::Float(0.42)));
+        assert_eq!(node2.metadata.get("model"), Some(&MetadataValue::String("sonnet".into())));
+        assert_eq!(node2.metadata.get("tokens"), Some(&MetadataValue::Int(1500)));
+        assert_eq!(node2.metadata.get("success"), Some(&MetadataValue::Bool(true)));
+    }
+
+    #[test]
+    fn serial_node_without_metadata_backward_compat() {
+        // Simulate JSON from before metadata was added (no metadata field)
+        let json = r#"{
+            "lineage_id": "00000000-0000-0000-0000-000000000001",
+            "version": 0,
+            "want_description": "test node",
+            "constraints": [],
+            "confidence": {
+                "comprehension": {"mean": 0.5, "variance": 0.25, "observations": 0},
+                "resolution": {"mean": 0.5, "variance": 0.25, "observations": 0},
+                "verification": {"mean": 0.5, "variance": 0.25, "observations": 0}
+            },
+            "resolution": {"state": "unresolved"},
+            "lamport_ts": 1
+        }"#;
+
+        let sn: SerialNodeEntry = serde_json::from_str(json).unwrap();
+        let (node, _) = sn.into_node().unwrap();
+        assert!(node.metadata.is_empty(), "Old files without metadata field should load with empty metadata");
+    }
+
+    #[test]
+    fn serial_fabric_with_metadata_roundtrip() {
+        use crate::node::MetadataValue;
+        let mut fabric = Fabric::new();
+        let mut node = IntentNode::new("track API usage");
+        node.metadata.insert("domain".into(), MetadataValue::String("system_telemetry".into()));
+        node.metadata.insert("cost".into(), MetadataValue::Float(0.15));
+        let id = fabric.add_node(node);
+
+        let sf = SerialFabric::from_fabric(&fabric);
+        let json = serde_json::to_string_pretty(&sf).unwrap();
+        let sf2: SerialFabric = serde_json::from_str(&json).unwrap();
+        let fabric2 = sf2.into_fabric().unwrap();
+
+        let node2 = fabric2.get_node(&id).unwrap();
+        assert_eq!(node2.metadata.get("domain"), Some(&MetadataValue::String("system_telemetry".into())));
+        assert_eq!(node2.metadata.get("cost"), Some(&MetadataValue::Float(0.15)));
     }
 }

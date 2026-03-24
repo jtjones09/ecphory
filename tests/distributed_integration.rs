@@ -3,7 +3,7 @@
 // Multi-replica simulation using DistributedFabric + LocalTransport.
 // Tests gossip protocol, conflict resolution, and vector clock convergence.
 
-use intent_node::*;
+use ecphory::*;
 
 // ─── Basic DistributedFabric Operations ───
 

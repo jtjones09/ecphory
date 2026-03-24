@@ -25,3 +25,7 @@ serde_json = "1"
 [lib]
 name = "ecphory"
 path = "src/lib.rs"
+
+[[bin]]
+name = "intent"
+path = "src/bin/intent.rs"

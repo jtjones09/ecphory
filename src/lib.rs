@@ -31,7 +31,7 @@ pub mod inference;
 pub mod distributed;
 
 // Re-export the main types at crate root for convenience
-pub use node::IntentNode;
+pub use node::{IntentNode, MetadataValue};
 pub use signature::{Signature, LineageId};
 pub use confidence::{ConfidenceSurface, Distribution};
 pub use constraint::{Constraint, ConstraintField, ConstraintKind};

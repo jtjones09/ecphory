@@ -6,7 +6,7 @@
 // - Cosine similarity outperforms Jaccard for semantic retrieval
 // - Embeddings survive persistence round-trips
 
-use intent_node::*;
+use ecphory::*;
 use std::fs;
 
 fn temp_path(name: &str) -> String {

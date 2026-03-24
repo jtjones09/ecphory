@@ -34,7 +34,71 @@ use crate::signature::{Signature, Signable, LineageId};
 use crate::confidence::ConfidenceSurface;
 use crate::constraint::ConstraintField;
 use crate::context::ContextField;
+use std::collections::HashMap;
 use std::fmt;
+
+/// Typed metadata value for arbitrary key-value pairs on nodes.
+///
+/// Metadata is mutable, NOT part of signature computation.
+/// It carries operational data (cost, model, timestamps, etc.)
+/// that enriches the node without changing its semantic identity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataValue {
+    String(String),
+    Float(f64),
+    Int(i64),
+    Bool(bool),
+}
+
+impl MetadataValue {
+    /// Parse a string into the most specific MetadataValue type.
+    /// "true"/"false" → Bool, integers → Int, decimals → Float, else String.
+    pub fn parse(s: &str) -> Self {
+        if s.eq_ignore_ascii_case("true") {
+            return MetadataValue::Bool(true);
+        }
+        if s.eq_ignore_ascii_case("false") {
+            return MetadataValue::Bool(false);
+        }
+        if let Ok(i) = s.parse::<i64>() {
+            return MetadataValue::Int(i);
+        }
+        if let Ok(f) = s.parse::<f64>() {
+            return MetadataValue::Float(f);
+        }
+        MetadataValue::String(s.to_string())
+    }
+
+    /// Get the value as f64, if numeric.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            MetadataValue::Float(f) => Some(*f),
+            MetadataValue::Int(i) => Some(*i as f64),
+            _ => None,
+        }
+    }
+
+    /// Get the value as a string representation.
+    pub fn as_str_repr(&self) -> String {
+        match self {
+            MetadataValue::String(s) => s.clone(),
+            MetadataValue::Float(f) => f.to_string(),
+            MetadataValue::Int(i) => i.to_string(),
+            MetadataValue::Bool(b) => b.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for MetadataValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MetadataValue::String(s) => write!(f, "{}", s),
+            MetadataValue::Float(v) => write!(f, "{}", v),
+            MetadataValue::Int(v) => write!(f, "{}", v),
+            MetadataValue::Bool(v) => write!(f, "{}", v),
+        }
+    }
+}
 
 /// The semantic shape of what "satisfied" looks like.
 ///
@@ -181,6 +245,10 @@ pub struct IntentNode {
 
     /// Provisional execution plan.
     pub resolution: ResolutionTarget,
+
+    /// Arbitrary typed key-value metadata.
+    /// NOT part of signature computation (metadata is mutable operational data).
+    pub metadata: HashMap<String, MetadataValue>,
 }
 
 impl IntentNode {
@@ -204,6 +272,7 @@ impl IntentNode {
             confidence,
             context,
             resolution,
+            metadata: HashMap::new(),
         }
     }
 
@@ -347,6 +416,12 @@ impl fmt::Display for IntentNode {
         writeln!(f, "  {}", self.confidence)?;
         writeln!(f, "  {}", self.context)?;
         writeln!(f, "  Resolution: {:?}", self.resolution)?;
+        if !self.metadata.is_empty() {
+            writeln!(f, "  Metadata:")?;
+            for (k, v) in &self.metadata {
+                writeln!(f, "    {}: {}", k, v)?;
+            }
+        }
         write!(f, "  Local weight: {:.3}", self.local_activation_weight())
     }
 }
@@ -509,5 +584,73 @@ mod tests {
             "Precondition: different lineage IDs");
         assert_eq!(n1.signature(), n2.signature(),
             "Lineage ID must NOT be included in signature computation");
+    }
+
+    // ── Metadata tests ──
+
+    #[test]
+    fn metadata_does_not_change_signature() {
+        let n1 = IntentNode::new("send message");
+        let mut n2 = IntentNode::new("send message");
+        n2.metadata.insert("cost".into(), MetadataValue::Float(0.42));
+        n2.recompute_signature();
+        assert_eq!(n1.signature(), n2.signature(),
+            "Metadata is operational data, not the node's meaning");
+    }
+
+    #[test]
+    fn metadata_value_parse_int() {
+        assert_eq!(MetadataValue::parse("42"), MetadataValue::Int(42));
+        assert_eq!(MetadataValue::parse("-7"), MetadataValue::Int(-7));
+    }
+
+    #[test]
+    fn metadata_value_parse_float() {
+        assert_eq!(MetadataValue::parse("3.14"), MetadataValue::Float(3.14));
+        assert_eq!(MetadataValue::parse("0.001"), MetadataValue::Float(0.001));
+    }
+
+    #[test]
+    fn metadata_value_parse_bool() {
+        assert_eq!(MetadataValue::parse("true"), MetadataValue::Bool(true));
+        assert_eq!(MetadataValue::parse("false"), MetadataValue::Bool(false));
+        assert_eq!(MetadataValue::parse("TRUE"), MetadataValue::Bool(true));
+    }
+
+    #[test]
+    fn metadata_value_parse_string() {
+        assert_eq!(MetadataValue::parse("hello"), MetadataValue::String("hello".into()));
+        assert_eq!(MetadataValue::parse("marketing"), MetadataValue::String("marketing".into()));
+    }
+
+    #[test]
+    fn new_node_has_empty_metadata() {
+        let node = IntentNode::new("test");
+        assert!(node.metadata.is_empty());
+    }
+
+    #[test]
+    fn display_includes_metadata_when_present() {
+        let mut node = IntentNode::new("test");
+        node.metadata.insert("cost".into(), MetadataValue::Float(0.42));
+        let display = format!("{}", node);
+        assert!(display.contains("Metadata:"));
+        assert!(display.contains("cost"));
+        assert!(display.contains("0.42"));
+    }
+
+    #[test]
+    fn display_omits_metadata_when_empty() {
+        let node = IntentNode::new("test");
+        let display = format!("{}", node);
+        assert!(!display.contains("Metadata:"));
+    }
+
+    #[test]
+    fn metadata_as_f64() {
+        assert_eq!(MetadataValue::Float(3.14).as_f64(), Some(3.14));
+        assert_eq!(MetadataValue::Int(42).as_f64(), Some(42.0));
+        assert_eq!(MetadataValue::String("hello".into()).as_f64(), None);
+        assert_eq!(MetadataValue::Bool(true).as_f64(), None);
     }
 }
