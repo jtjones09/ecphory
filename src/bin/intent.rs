@@ -5,11 +5,13 @@
 //   intent fabric list      [--project name]
 //   intent fabric search    [--query "..."] [--where "key=value AND ..."] [--project name]
 //   intent fabric aggregate --field F --op OP [--where "..."] [--group-by key] [--project name]
+//   intent fabric stats     [--project name]
 
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ecphory::node::{IntentNode, MetadataValue};
 use ecphory::persist::{FabricStore, JsonFileStore};
@@ -200,6 +202,94 @@ fn find_flag_value(args: &[String], flag: &str) -> Option<String> {
     None
 }
 
+// ═══════════════════════════════════════════════
+//  Weight Decay — Retrieval IS Reinforcement
+// ═══════════════════════════════════════════════
+
+fn now_iso() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Simple ISO-ish timestamp from epoch seconds
+    // Format: seconds since epoch as a string (parseable, sortable)
+    // We use a proper format for human readability
+    let days = secs / 86400;
+    let remaining = secs % 86400;
+    let hours = remaining / 3600;
+    let minutes = (remaining % 3600) / 60;
+    let seconds = remaining % 60;
+    // Approximate date calculation from epoch
+    // Good enough for decay computation — not a calendar library
+    let year = 1970 + (days / 365); // approximate
+    let day_of_year = days % 365;
+    let month = day_of_year / 30 + 1;
+    let day = day_of_year % 30 + 1;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month.min(12), day.min(28), hours, minutes, seconds)
+}
+
+fn epoch_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn parse_iso_to_epoch(iso: &str) -> Option<f64> {
+    // Parse our ISO format: YYYY-MM-DDThh:mm:ssZ
+    // Simple parser — extract components and approximate epoch
+    let parts: Vec<&str> = iso.split('T').collect();
+    if parts.len() != 2 { return None; }
+    let date_parts: Vec<u64> = parts[0].split('-').filter_map(|s| s.parse().ok()).collect();
+    let time_str = parts[1].trim_end_matches('Z');
+    let time_parts: Vec<u64> = time_str.split(':').filter_map(|s| s.parse().ok()).collect();
+    if date_parts.len() != 3 || time_parts.len() != 3 { return None; }
+    let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
+    let (hour, min, sec) = (time_parts[0], time_parts[1], time_parts[2]);
+    // Approximate epoch calculation
+    let days = (year - 1970) * 365 + (month - 1) * 30 + (day - 1);
+    let secs = days * 86400 + hour * 3600 + min * 60 + sec;
+    Some(secs as f64)
+}
+
+fn stamp_activation(node: &mut IntentNode) {
+    node.metadata.insert("last_activated".into(), MetadataValue::String(now_iso()));
+    let count = node.metadata.get("activation_count")
+        .and_then(|v| if let MetadataValue::Int(i) = v { Some(*i) } else { None })
+        .unwrap_or(0);
+    node.metadata.insert("activation_count".into(), MetadataValue::Int(count + 1));
+}
+
+/// Compute composite weight for a node.
+/// Formula: (comprehension * 0.3) + (temporal_recency * 0.3) + (activation_frequency * 0.2) + (resonance_score * 0.2)
+fn compute_composite_weight(node: &IntentNode, resonance_score: f64, half_life_days: f64) -> f64 {
+    // Comprehension from confidence surface
+    let comprehension = node.confidence.comprehension.mean;
+
+    // Temporal recency: exponential decay from last_activated
+    let temporal_recency = if let Some(MetadataValue::String(ts)) = node.metadata.get("last_activated") {
+        if let Some(activated_epoch) = parse_iso_to_epoch(ts) {
+            let now = epoch_secs();
+            let age_secs = (now - activated_epoch).max(0.0);
+            let half_life_secs = half_life_days * 86400.0;
+            let lambda = (2.0_f64.ln()) / half_life_secs;
+            (-lambda * age_secs).exp()
+        } else {
+            0.5 // Can't parse timestamp, use neutral value
+        }
+    } else {
+        1.0 // No last_activated = brand new node, full recency
+    };
+
+    // Activation frequency: log(activation_count + 1), normalized to [0, 1] range
+    let activation_count = node.metadata.get("activation_count")
+        .and_then(|v| if let MetadataValue::Int(i) = v { Some(*i) } else { None })
+        .unwrap_or(0);
+    let activation_freq = ((activation_count as f64 + 1.0).ln() / 10.0_f64.ln()).min(1.0);
+
+    (comprehension * 0.3) + (temporal_recency * 0.3) + (activation_freq * 0.2) + (resonance_score * 0.2)
+}
+
 fn print_node_line(id: &LineageId, node: &IntentNode, prefix: &str) {
     println!("{}[{}] {}", prefix, &id.as_uuid().to_string()[..8], node.want.description);
     if !node.metadata.is_empty() {
@@ -231,6 +321,9 @@ fn cmd_fabric_add(args: &[String]) {
 
     let mut node = IntentNode::understood(&want, confidence);
     node.metadata = meta;
+    // Stamp initial activation
+    node.metadata.insert("last_activated".into(), MetadataValue::String(now_iso()));
+    node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
 
     let id = fabric.add_node(node);
     save_fabric(&fabric, &path);
@@ -270,6 +363,9 @@ fn cmd_fabric_search(args: &[String]) {
     let k: usize = find_flag_value(args, "--limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    let half_life: f64 = find_flag_value(args, "--decay-halflife")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7.0); // Default: 7 days
 
     if query.is_none() && where_clause.is_none() {
         eprintln!("Error: --query and/or --where is required for 'fabric search'");
@@ -295,28 +391,41 @@ fn cmd_fabric_search(args: &[String]) {
 
         let results = fabric.resonate(q, k * 5); // Over-fetch to allow filtering
 
-        let filtered: Vec<_> = results.iter()
-            .filter(|r| {
-                fabric.get_node(&r.lineage_id)
-                    .map(|n| node_matches_predicates(n, &predicates))
-                    .unwrap_or(false)
-            })
-            .take(k)
-            .collect();
+        // Filter by predicates and compute composite weight
+        let mut scored: Vec<(LineageId, f64, f64)> = Vec::new(); // (id, composite_weight, resonance)
+        for r in &results {
+            if let Some(node) = fabric.get_node(&r.lineage_id) {
+                if node_matches_predicates(node, &predicates) {
+                    let cw = compute_composite_weight(node, r.score, half_life);
+                    scored.push((r.lineage_id.clone(), cw, r.score));
+                }
+            }
+        }
 
-        if filtered.is_empty() {
+        // Sort by composite_weight descending
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let scored: Vec<_> = scored.into_iter().take(k).collect();
+
+        // Stamp activation on returned nodes (retrieval IS reinforcement)
+        for (id, _, _) in &scored {
+            fabric.mutate_node(id, |n| stamp_activation(n)).ok();
+        }
+
+        if scored.is_empty() {
             println!("No results found.");
         } else {
-            println!("Search results ({} found):", filtered.len());
+            println!("Search results ({} found):", scored.len());
             println!("{:-<70}", "");
-            for r in &filtered {
-                if let Some(node) = fabric.get_node(&r.lineage_id) {
-                    print!("  [{:.3}] ", r.score);
-                    println!("{} — {}", &r.lineage_id.as_uuid().to_string()[..8], node.want.description);
+            for (id, cw, res) in &scored {
+                if let Some(node) = fabric.get_node(id) {
+                    println!("  [w:{:.3} r:{:.3}] {} — {}",
+                        cw, res, &id.as_uuid().to_string()[..8], node.want.description);
                     if !node.metadata.is_empty() {
                         print!("         ");
                         for (k, v) in &node.metadata {
-                            print!("{}={} ", k, v);
+                            if k != "last_activated" && k != "activation_count" {
+                                print!("{}={} ", k, v);
+                            }
                         }
                         println!();
                     }
@@ -326,29 +435,46 @@ fn cmd_fabric_search(args: &[String]) {
 
         save_fabric(&fabric, &path);
     } else {
-        // Pure predicate filter — no semantic query, return all matching sorted by recency
-        let mut matches: Vec<(&LineageId, &IntentNode)> = fabric.nodes()
-            .filter(|(_, n)| node_matches_predicates(n, &predicates))
-            .collect();
-
-        // Sort by lamport timestamp (most recent first) — use lineage_id order as fallback
-        matches.sort_by(|(a_id, _), (b_id, _)| {
-            let a_ts = fabric.node_lamport_ts(a_id).unwrap_or(0);
-            let b_ts = fabric.node_lamport_ts(b_id).unwrap_or(0);
-            b_ts.cmp(&a_ts)
-        });
-
-        let matches: Vec<_> = matches.into_iter().take(k).collect();
-
-        if matches.is_empty() {
-            println!("No matching nodes found.");
-        } else {
-            println!("Matching nodes ({} found):", matches.len());
-            println!("{:-<70}", "");
-            for (id, node) in &matches {
-                print_node_line(id, node, "  ");
+        // Pure predicate filter — sort by composite_weight
+        let mut scored: Vec<(LineageId, f64)> = Vec::new();
+        for (id, node) in fabric.nodes() {
+            if node_matches_predicates(node, &predicates) {
+                let cw = compute_composite_weight(node, 0.0, half_life);
+                scored.push((id.clone(), cw));
             }
         }
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let scored: Vec<_> = scored.into_iter().take(k).collect();
+
+        // Stamp activation
+        for (id, _) in &scored {
+            fabric.mutate_node(id, |n| stamp_activation(n)).ok();
+        }
+
+        if scored.is_empty() {
+            println!("No matching nodes found.");
+        } else {
+            println!("Matching nodes ({} found):", scored.len());
+            println!("{:-<70}", "");
+            for (id, cw) in &scored {
+                if let Some(node) = fabric.get_node(id) {
+                    print!("  [w:{:.3}] ", cw);
+                    println!("{} — {}", &id.as_uuid().to_string()[..8], node.want.description);
+                    if !node.metadata.is_empty() {
+                        print!("         ");
+                        for (k, v) in &node.metadata {
+                            if k != "last_activated" && k != "activation_count" {
+                                print!("{}={} ", k, v);
+                            }
+                        }
+                        println!();
+                    }
+                }
+            }
+        }
+
+        save_fabric(&fabric, &path);
     }
 }
 
@@ -451,17 +577,123 @@ fn compute_aggregate(op: &str, values: &[f64]) -> f64 {
     }
 }
 
+fn cmd_fabric_stats(args: &[String]) {
+    let project = find_flag_value(args, "--project").unwrap_or_else(|| "default".to_string());
+    let half_life: f64 = find_flag_value(args, "--decay-halflife")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7.0);
+
+    let (fabric, _) = load_or_create_fabric(&project);
+
+    let count = fabric.node_count();
+    if count == 0 {
+        println!("No nodes in project '{}'.", project);
+        return;
+    }
+
+    // Compute weights for all nodes
+    let mut weights: Vec<(String, String, f64, i64)> = Vec::new(); // (id, want, weight, activation_count)
+    let mut oldest_name = String::new();
+    let mut oldest_ts = f64::MAX;
+    let mut most_activated_name = String::new();
+    let mut most_activated_count: i64 = -1;
+    let mut least_activated_name = String::new();
+    let mut least_activated_count: i64 = i64::MAX;
+
+    for (id, node) in fabric.nodes() {
+        let cw = compute_composite_weight(node, 0.0, half_life);
+        let act_count = node.metadata.get("activation_count")
+            .and_then(|v| if let MetadataValue::Int(i) = v { Some(*i) } else { None })
+            .unwrap_or(0);
+
+        let short_id = id.as_uuid().to_string()[..8].to_string();
+        let desc = if node.want.description.len() > 40 {
+            format!("{}...", &node.want.description[..37])
+        } else {
+            node.want.description.clone()
+        };
+
+        weights.push((short_id, desc.clone(), cw, act_count));
+
+        // Track oldest
+        if let Some(MetadataValue::String(ts)) = node.metadata.get("last_activated") {
+            if let Some(epoch) = parse_iso_to_epoch(ts) {
+                if epoch < oldest_ts {
+                    oldest_ts = epoch;
+                    oldest_name = desc.clone();
+                }
+            }
+        }
+
+        // Track most/least activated
+        if act_count > most_activated_count {
+            most_activated_count = act_count;
+            most_activated_name = desc.clone();
+        }
+        if act_count < least_activated_count {
+            least_activated_count = act_count;
+            least_activated_name = desc.clone();
+        }
+    }
+
+    // Sort by weight descending
+    weights.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!("Fabric Stats for '{}' ({} nodes):", project, count);
+    println!("{:=<70}", "");
+
+    // Weight distribution histogram
+    let mut buckets = [0u32; 10]; // [0.0-0.1, 0.1-0.2, ..., 0.9-1.0]
+    for (_, _, w, _) in &weights {
+        let bucket = ((*w * 10.0).floor() as usize).min(9);
+        buckets[bucket] += 1;
+    }
+
+    println!("\n  Weight Distribution:");
+    for i in (0..10).rev() {
+        let lower = i as f64 / 10.0;
+        let upper = (i + 1) as f64 / 10.0;
+        let bar: String = "█".repeat(buckets[i] as usize);
+        if buckets[i] > 0 {
+            println!("  {:.1}-{:.1} | {} ({})", lower, upper, bar, buckets[i]);
+        }
+    }
+
+    println!("\n  Top 5 by weight:");
+    for (id, desc, w, ac) in weights.iter().take(5) {
+        println!("    [{:.3}] {} — {} (activated {} times)", w, id, desc, ac);
+    }
+
+    println!("\n  Bottom 5 by weight:");
+    for (id, desc, w, ac) in weights.iter().rev().take(5) {
+        println!("    [{:.3}] {} — {} (activated {} times)", w, id, desc, ac);
+    }
+
+    println!("\n  Highlights:");
+    if !oldest_name.is_empty() {
+        println!("    Oldest node: {}", oldest_name);
+    }
+    if most_activated_count >= 0 {
+        println!("    Most activated: {} ({} times)", most_activated_name, most_activated_count);
+    }
+    if least_activated_count < i64::MAX {
+        println!("    Least activated: {} ({} times)", least_activated_name, least_activated_count);
+    }
+}
+
 fn print_usage() {
     eprintln!("Usage: intent <command> [options]");
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  fabric add       --want \"...\" [--meta \"key=value\"]... [--project name]");
     eprintln!("  fabric list      [--project name]");
-    eprintln!("  fabric search    [--query \"...\"] [--where \"key=value AND ...\"] [--project name]");
+    eprintln!("  fabric search    [--query \"...\"] [--where \"...\"] [--decay-halflife N] [--project name]");
     eprintln!("  fabric aggregate --field F --op OP [--where \"...\"] [--group-by key] [--project name]");
+    eprintln!("  fabric stats     [--project name] [--decay-halflife N]");
     eprintln!();
     eprintln!("Predicate operators: =, !=, >, <, >=, <=");
     eprintln!("Aggregate operations: sum, avg, min, max, count");
+    eprintln!("Decay half-life: days (default 7). Controls temporal recency weighting.");
 }
 
 fn main() {
@@ -480,6 +712,7 @@ fn main() {
         ("fabric", "list") => cmd_fabric_list(&args[3..]),
         ("fabric", "search") => cmd_fabric_search(&args[3..]),
         ("fabric", "aggregate") => cmd_fabric_aggregate(&args[3..]),
+        ("fabric", "stats") => cmd_fabric_stats(&args[3..]),
         _ => {
             eprintln!("Unknown command: {} {}", cmd1, cmd2);
             print_usage();
@@ -621,5 +854,109 @@ mod tests {
         meta.insert("success".into(), MetadataValue::Bool(true));
         let pred = Predicate { key: "success".into(), op: CmpOp::Eq, value: "true".into() };
         assert!(predicate_matches(&meta, &pred));
+    }
+
+    // ── Weight Decay Tests ──
+
+    #[test]
+    fn new_node_has_composite_weight() {
+        let mut node = IntentNode::understood("test", 0.8);
+        node.metadata.insert("last_activated".into(), MetadataValue::String(now_iso()));
+        node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+        let cw = compute_composite_weight(&node, 0.5, 7.0);
+        assert!(cw > 0.0, "New node should have positive composite weight");
+    }
+
+    #[test]
+    fn retrieved_node_has_higher_activation() {
+        let mut node = IntentNode::understood("test", 0.8);
+        node.metadata.insert("last_activated".into(), MetadataValue::String(now_iso()));
+        node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+
+        let cw1 = compute_composite_weight(&node, 0.5, 7.0);
+
+        // Simulate retrieval
+        stamp_activation(&mut node);
+        stamp_activation(&mut node);
+        stamp_activation(&mut node);
+
+        let cw2 = compute_composite_weight(&node, 0.5, 7.0);
+        assert!(cw2 > cw1, "Node retrieved multiple times should have higher weight. cw1={}, cw2={}", cw1, cw2);
+    }
+
+    #[test]
+    fn old_node_has_lower_temporal_recency() {
+        // Node activated 14 days ago
+        let mut old_node = IntentNode::understood("old test", 0.8);
+        // Simulate 14 days ago: subtract 14*86400 seconds
+        let old_epoch = epoch_secs() - 14.0 * 86400.0;
+        let days = (old_epoch / 86400.0).floor() as u64;
+        let remaining = (old_epoch % 86400.0) as u64;
+        let year = 1970 + days / 365;
+        let day_of_year = days % 365;
+        let month = day_of_year / 30 + 1;
+        let day = day_of_year % 30 + 1;
+        let hours = remaining / 3600;
+        let minutes = (remaining % 3600) / 60;
+        let seconds = remaining % 60;
+        let old_ts = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month.min(12), day.min(28), hours, minutes, seconds);
+        old_node.metadata.insert("last_activated".into(), MetadataValue::String(old_ts));
+        old_node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+
+        // Fresh node
+        let mut fresh_node = IntentNode::understood("fresh test", 0.8);
+        fresh_node.metadata.insert("last_activated".into(), MetadataValue::String(now_iso()));
+        fresh_node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+
+        let cw_old = compute_composite_weight(&old_node, 0.5, 7.0);
+        let cw_fresh = compute_composite_weight(&fresh_node, 0.5, 7.0);
+        assert!(cw_fresh > cw_old, "Fresh node should have higher weight. fresh={}, old={}", cw_fresh, cw_old);
+    }
+
+    #[test]
+    fn high_activation_compensates_low_recency() {
+        // Old node but highly activated
+        let mut old_active = IntentNode::understood("old but popular", 0.8);
+        let old_epoch = epoch_secs() - 14.0 * 86400.0;
+        let days = (old_epoch / 86400.0).floor() as u64;
+        let remaining = (old_epoch % 86400.0) as u64;
+        let year = 1970 + days / 365;
+        let day_of_year = days % 365;
+        let month = day_of_year / 30 + 1;
+        let day = day_of_year % 30 + 1;
+        let hours = remaining / 3600;
+        let minutes = (remaining % 3600) / 60;
+        let seconds = remaining % 60;
+        let old_ts = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month.min(12), day.min(28), hours, minutes, seconds);
+        old_active.metadata.insert("last_activated".into(), MetadataValue::String(old_ts));
+        old_active.metadata.insert("activation_count".into(), MetadataValue::Int(50));
+
+        let cw = compute_composite_weight(&old_active, 0.5, 7.0);
+        assert!(cw > 0.3, "Old but highly activated node should still have meaningful weight: {}", cw);
+    }
+
+    #[test]
+    fn stamp_activation_increments_count() {
+        let mut node = IntentNode::new("test");
+        node.metadata.insert("activation_count".into(), MetadataValue::Int(3));
+        stamp_activation(&mut node);
+        assert_eq!(node.metadata.get("activation_count"), Some(&MetadataValue::Int(4)));
+    }
+
+    #[test]
+    fn stamp_activation_updates_timestamp() {
+        let mut node = IntentNode::new("test");
+        stamp_activation(&mut node);
+        assert!(node.metadata.contains_key("last_activated"));
+    }
+
+    #[test]
+    fn parse_iso_roundtrip() {
+        let ts = now_iso();
+        let epoch = parse_iso_to_epoch(&ts);
+        assert!(epoch.is_some(), "Should parse our own timestamp format");
+        let now = epoch_secs();
+        // Should be within 60 seconds of now
+        assert!((epoch.unwrap() - now).abs() < 60.0, "Parsed time should be close to current time");
     }
 }
