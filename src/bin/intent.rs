@@ -287,7 +287,17 @@ fn compute_composite_weight(node: &IntentNode, resonance_score: f64, half_life_d
         .unwrap_or(0);
     let activation_freq = ((activation_count as f64 + 1.0).ln() / 10.0_f64.ln()).min(1.0);
 
-    (comprehension * 0.3) + (temporal_recency * 0.3) + (activation_freq * 0.2) + (resonance_score * 0.2)
+    let raw = (comprehension * 0.3) + (temporal_recency * 0.3) + (activation_freq * 0.2) + (resonance_score * 0.2);
+
+    // Systemic nodes (innate layer) never decay below 0.5
+    let is_systemic = node.metadata.get("kind")
+        .map(|v| v.as_str_repr() == "systemic")
+        .unwrap_or(false);
+    if is_systemic {
+        raw.max(0.5)
+    } else {
+        raw
+    }
 }
 
 fn print_node_line(id: &LineageId, node: &IntentNode, prefix: &str) {
@@ -303,8 +313,89 @@ fn print_node_line(id: &LineageId, node: &IntentNode, prefix: &str) {
 }
 
 // ═══════════════════════════════════════════════
+//  Systemic Intent Nodes
+// ═══════════════════════════════════════════════
+
+struct SystemicDef {
+    want: &'static str,
+    domain: &'static str,
+    category: &'static str,
+}
+
+const SYSTEMIC_NODES: &[SystemicDef] = &[
+    SystemicDef {
+        want: "Maintain fabric coherence — no duplicate knowledge, no contradictions",
+        domain: "system",
+        category: "coherence",
+    },
+    SystemicDef {
+        want: "Track all operations — every API call, every tool use, every decision",
+        domain: "system_telemetry",
+        category: "self_monitoring",
+    },
+    SystemicDef {
+        want: "Strengthen high-value knowledge — frequently accessed nodes should be easy to find",
+        domain: "system",
+        category: "optimization",
+    },
+    SystemicDef {
+        want: "Identify knowledge gaps — notice when queries return low-confidence results",
+        domain: "system",
+        category: "growth",
+    },
+    SystemicDef {
+        want: "Preserve context across sessions — key decisions and reasoning should persist",
+        domain: "system",
+        category: "continuity",
+    },
+];
+
+fn has_systemic_nodes(fabric: &Fabric) -> bool {
+    fabric.nodes().any(|(_, n)| {
+        n.metadata.get("kind")
+            .map(|v| v.as_str_repr() == "systemic")
+            .unwrap_or(false)
+    })
+}
+
+fn seed_systemic_nodes(fabric: &mut Fabric) -> usize {
+    let mut count = 0;
+    for def in SYSTEMIC_NODES {
+        let mut node = IntentNode::understood(def.want, 0.9);
+        node.metadata.insert("kind".into(), MetadataValue::String("systemic".into()));
+        node.metadata.insert("domain".into(), MetadataValue::String(def.domain.into()));
+        node.metadata.insert("category".into(), MetadataValue::String(def.category.into()));
+        node.metadata.insert("last_activated".into(), MetadataValue::String(now_iso()));
+        node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+        fabric.add_node(node);
+        count += 1;
+    }
+    count
+}
+
+fn is_systemic(node: &IntentNode) -> bool {
+    node.metadata.get("kind")
+        .map(|v| v.as_str_repr() == "systemic")
+        .unwrap_or(false)
+}
+
+// ═══════════════════════════════════════════════
 //  Commands
 // ═══════════════════════════════════════════════
+
+fn cmd_fabric_init(args: &[String]) {
+    let project = find_flag_value(args, "--project").unwrap_or_else(|| "default".to_string());
+    let (mut fabric, path) = load_or_create_fabric(&project);
+
+    if has_systemic_nodes(&fabric) {
+        println!("Project '{}' already has systemic nodes. Skipping.", project);
+        return;
+    }
+
+    let count = seed_systemic_nodes(&mut fabric);
+    save_fabric(&fabric, &path);
+    println!("Seeded {} systemic intent nodes for project '{}'.", count, project);
+}
 
 fn cmd_fabric_add(args: &[String]) {
     let want = find_flag_value(args, "--want").unwrap_or_else(|| {
@@ -318,6 +409,14 @@ fn cmd_fabric_add(args: &[String]) {
         .unwrap_or(0.7);
 
     let (mut fabric, path) = load_or_create_fabric(&project);
+
+    // Auto-seed systemic nodes on first use of a project
+    if !has_systemic_nodes(&fabric) {
+        let seeded = seed_systemic_nodes(&mut fabric);
+        if seeded > 0 {
+            eprintln!("Initialized {} systemic nodes for project '{}'.", seeded, project);
+        }
+    }
 
     let mut node = IntentNode::understood(&want, confidence);
     node.metadata = meta;
@@ -342,6 +441,7 @@ fn cmd_fabric_add(args: &[String]) {
 
 fn cmd_fabric_list(args: &[String]) {
     let project = find_flag_value(args, "--project").unwrap_or_else(|| "default".to_string());
+    let systemic_only = args.iter().any(|a| a == "--systemic");
     let (fabric, _) = load_or_create_fabric(&project);
 
     if fabric.node_count() == 0 {
@@ -349,9 +449,19 @@ fn cmd_fabric_list(args: &[String]) {
         return;
     }
 
-    println!("Nodes in project '{}' ({} total):", project, fabric.node_count());
+    let nodes: Vec<_> = fabric.nodes()
+        .filter(|(_, n)| !systemic_only || is_systemic(n))
+        .collect();
+
+    if nodes.is_empty() {
+        println!("No {} nodes in project '{}'.", if systemic_only { "systemic" } else { "" }, project);
+        return;
+    }
+
+    let label = if systemic_only { "Systemic nodes" } else { "Nodes" };
+    println!("{} in project '{}' ({} total):", label, project, nodes.len());
     println!("{:-<70}", "");
-    for (id, node) in fabric.nodes() {
+    for (id, node) in &nodes {
         print_node_line(id, node, "  ");
     }
 }
@@ -685,8 +795,9 @@ fn print_usage() {
     eprintln!("Usage: intent <command> [options]");
     eprintln!();
     eprintln!("Commands:");
+    eprintln!("  fabric init      [--project name]  — seed systemic intent nodes");
     eprintln!("  fabric add       --want \"...\" [--meta \"key=value\"]... [--project name]");
-    eprintln!("  fabric list      [--project name]");
+    eprintln!("  fabric list      [--project name] [--systemic]");
     eprintln!("  fabric search    [--query \"...\"] [--where \"...\"] [--decay-halflife N] [--project name]");
     eprintln!("  fabric aggregate --field F --op OP [--where \"...\"] [--group-by key] [--project name]");
     eprintln!("  fabric stats     [--project name] [--decay-halflife N]");
@@ -708,6 +819,7 @@ fn main() {
     let cmd2 = args[2].as_str();
 
     match (cmd1, cmd2) {
+        ("fabric", "init") => cmd_fabric_init(&args[3..]),
         ("fabric", "add") => cmd_fabric_add(&args[3..]),
         ("fabric", "list") => cmd_fabric_list(&args[3..]),
         ("fabric", "search") => cmd_fabric_search(&args[3..]),
@@ -958,5 +1070,73 @@ mod tests {
         let now = epoch_secs();
         // Should be within 60 seconds of now
         assert!((epoch.unwrap() - now).abs() < 60.0, "Parsed time should be close to current time");
+    }
+
+    // ── Systemic Node Tests ──
+
+    #[test]
+    fn systemic_nodes_seeded_on_empty_fabric() {
+        let mut fabric = Fabric::new();
+        assert!(!has_systemic_nodes(&fabric));
+        let count = seed_systemic_nodes(&mut fabric);
+        assert_eq!(count, 5);
+        assert!(has_systemic_nodes(&fabric));
+    }
+
+    #[test]
+    fn systemic_nodes_not_duplicated() {
+        let mut fabric = Fabric::new();
+        seed_systemic_nodes(&mut fabric);
+        assert_eq!(fabric.node_count(), 5);
+        // Check that has_systemic_nodes returns true, preventing re-seeding
+        assert!(has_systemic_nodes(&fabric));
+    }
+
+    #[test]
+    fn systemic_nodes_have_correct_metadata() {
+        let mut fabric = Fabric::new();
+        seed_systemic_nodes(&mut fabric);
+        for (_, node) in fabric.nodes() {
+            assert_eq!(node.metadata.get("kind"), Some(&MetadataValue::String("systemic".into())));
+            assert!(node.metadata.contains_key("domain"));
+            assert!(node.metadata.contains_key("category"));
+        }
+    }
+
+    #[test]
+    fn systemic_nodes_have_high_confidence() {
+        let mut fabric = Fabric::new();
+        seed_systemic_nodes(&mut fabric);
+        for (_, node) in fabric.nodes() {
+            assert!((node.confidence.comprehension.mean - 0.9).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn systemic_nodes_minimum_weight_floor() {
+        let mut node = IntentNode::understood("test systemic", 0.1);
+        node.metadata.insert("kind".into(), MetadataValue::String("systemic".into()));
+        // Even with low confidence and old timestamp, weight should be >= 0.5
+        node.metadata.insert("last_activated".into(), MetadataValue::String("2020-01-01T00:00:00Z".into()));
+        node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+        let cw = compute_composite_weight(&node, 0.0, 7.0);
+        assert!(cw >= 0.5, "Systemic node weight should never go below 0.5, got {}", cw);
+    }
+
+    #[test]
+    fn non_systemic_nodes_can_decay_below_half() {
+        let mut node = IntentNode::understood("test regular", 0.1);
+        node.metadata.insert("last_activated".into(), MetadataValue::String("2020-01-01T00:00:00Z".into()));
+        node.metadata.insert("activation_count".into(), MetadataValue::Int(0));
+        let cw = compute_composite_weight(&node, 0.0, 7.0);
+        assert!(cw < 0.5, "Regular node should be able to decay below 0.5, got {}", cw);
+    }
+
+    #[test]
+    fn is_systemic_correct() {
+        let mut node = IntentNode::new("test");
+        assert!(!is_systemic(&node));
+        node.metadata.insert("kind".into(), MetadataValue::String("systemic".into()));
+        assert!(is_systemic(&node));
     }
 }
