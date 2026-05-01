@@ -12,7 +12,9 @@
 // suffices, and trust comes from the immune system (Spec 6).
 
 use crate::identity::content_fingerprint::ContentFingerprint;
+use crate::identity::edit_mode::EditMode;
 use crate::identity::voice_print::{AgentKeypair, VoicePrint};
+use crate::signature::LineageId;
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier};
 
 /// A per-node Ed25519 signature attached to high-sensitivity nodes.
@@ -63,7 +65,7 @@ impl NodeSignature {
     }
 }
 
-/// Errors emitted by the fabric's create-node path.
+/// Errors emitted by the fabric's write paths (Spec 5 §3.3, Spec 8 §7).
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteError {
     /// Target region is `sensitivity: high` but no signer was provided.
@@ -73,6 +75,31 @@ pub enum WriteError {
     InvalidSignature,
     /// The named namespace has not been registered with the fabric.
     UnknownNamespace,
+    /// Mechanical edit contention (Spec 8 §3.2.2). Another agent holds
+    /// the per-node lock on the target. Caller retries.
+    NodeLocked {
+        by: VoicePrint,
+        /// Wall-clock ns at which the lock-holder's 500ms deadline elapses.
+        /// Hint to the caller — they may retry sooner.
+        until_ns: i128,
+    },
+    /// Semantic edit checkout TTL expired before finalization (Spec 8 §3.4.1).
+    CheckoutExpired { checkout: LineageId },
+    /// The target's recorded `EditMode` doesn't match the operation.
+    /// Example: `edit_mechanical` invoked on a node tagged `Semantic`.
+    EditModeMismatch { expected: EditMode, got: &'static str },
+    /// Snapshot transition is in progress (Spec 8 §3.4.3 atomic
+    /// `SnapshotLock`). New checkouts must retry after a bounded delay.
+    SnapshotInProgress,
+    /// Backpressure on the snapshot/persistence queue (Spec 8 §2.6.3).
+    FabricCongested,
+    /// Fabric is in degraded mode after a caught panic (Spec 8 §2.6.4).
+    /// Reads continue; writes are refused until restart.
+    FabricDegraded,
+    /// A panic was caught at the trait boundary (Spec 8 §2.6.4).
+    FabricInternal(String),
+    /// The referenced node is not in the fabric.
+    NodeNotFound(LineageId),
 }
 
 impl std::fmt::Display for WriteError {
@@ -86,6 +113,34 @@ impl std::fmt::Display for WriteError {
                 write!(f, "provided signature failed verification")
             }
             WriteError::UnknownNamespace => write!(f, "namespace not registered with fabric"),
+            WriteError::NodeLocked { by, until_ns } => write!(
+                f,
+                "node locked by {} until {}ns (wall-clock); retry after backoff",
+                by, until_ns
+            ),
+            WriteError::CheckoutExpired { checkout } => {
+                write!(f, "checkout {} expired before finalization", checkout)
+            }
+            WriteError::EditModeMismatch { expected, got } => write!(
+                f,
+                "edit mode mismatch: target is {:?}, operation requires {}",
+                expected, got
+            ),
+            WriteError::SnapshotInProgress => write!(
+                f,
+                "consensus snapshot in progress; retry after bounded delay (default 100ms)"
+            ),
+            WriteError::FabricCongested => {
+                write!(f, "fabric snapshot queue is full; retry after backpressure clears")
+            }
+            WriteError::FabricDegraded => write!(
+                f,
+                "fabric is in degraded mode (post-panic); reads available, writes refused"
+            ),
+            WriteError::FabricInternal(reason) => {
+                write!(f, "fabric internal error: {}", reason)
+            }
+            WriteError::NodeNotFound(id) => write!(f, "node not found: {}", id),
         }
     }
 }

@@ -46,7 +46,7 @@ pub enum TraceEvent {
 /// Implement this to receive trace events from the fabric.
 /// The fabric calls `trace()` on every significant operation.
 /// Default implementation: NoopTracer (zero cost).
-pub trait FabricTracer {
+pub trait FabricTracer: Send + Sync {
     fn trace(&self, event: &TraceEvent);
 }
 
@@ -69,32 +69,32 @@ impl FabricTracer for PrintTracer {
 
 /// Collects trace events in a Vec. For testing.
 ///
-/// Uses RefCell for interior mutability so the tracer
-/// can be shared with the fabric (which calls trace(&self)).
+/// Uses `Mutex` for interior mutability so the tracer can be shared
+/// with the fabric across threads (the bridge requires `Send + Sync`).
 pub struct CollectingTracer {
-    events: std::cell::RefCell<Vec<TraceEvent>>,
+    events: std::sync::Mutex<Vec<TraceEvent>>,
 }
 
 impl CollectingTracer {
     pub fn new() -> Self {
         Self {
-            events: std::cell::RefCell::new(Vec::new()),
+            events: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Get a snapshot of all collected events.
     pub fn events(&self) -> Vec<TraceEvent> {
-        self.events.borrow().clone()
+        self.events.lock().expect("CollectingTracer poisoned").clone()
     }
 
     /// How many events have been collected.
     pub fn count(&self) -> usize {
-        self.events.borrow().len()
+        self.events.lock().expect("CollectingTracer poisoned").len()
     }
 
     /// Clear all collected events.
     pub fn clear(&self) {
-        self.events.borrow_mut().clear();
+        self.events.lock().expect("CollectingTracer poisoned").clear();
     }
 }
 
@@ -106,7 +106,10 @@ impl Default for CollectingTracer {
 
 impl FabricTracer for CollectingTracer {
     fn trace(&self, event: &TraceEvent) {
-        self.events.borrow_mut().push(event.clone());
+        self.events
+            .lock()
+            .expect("CollectingTracer poisoned")
+            .push(event.clone());
     }
 }
 

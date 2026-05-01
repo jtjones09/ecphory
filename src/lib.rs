@@ -26,6 +26,7 @@ pub mod node;
 pub mod temporal;
 pub mod tracer;
 pub mod fabric;
+pub mod bridge;
 pub mod persist;
 pub mod embedding;
 pub mod inference;
@@ -53,7 +54,7 @@ pub use distributed::{
 };
 pub use identity::{
     AgentKeypair, AgentRelation, CausalPosition, ConflictingSignal, ContentFingerprint,
-    CrossAttestation, FabricQuestion, GenesisCommitment, GenesisEvent, GenesisTuple,
+    CrossAttestation, EditMode, FabricQuestion, GenesisCommitment, GenesisEvent, GenesisTuple,
     NamespaceId, NodeIdentity, NodeQuarantineState, NodeSignature, QuarantineReason,
     RegionSensitivity, SignalType, TopologicalPosition, TrustWeight, VoicePrint,
     WitnessType, WriteError, generate_agent_keypair,

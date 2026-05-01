@@ -17,6 +17,7 @@
 pub mod content_fingerprint;
 pub mod voice_print;
 pub mod causal_position;
+pub mod edit_mode;
 pub mod genesis;
 pub mod node_identity;
 pub mod node_signature;
@@ -28,6 +29,7 @@ pub mod region;
 pub use content_fingerprint::ContentFingerprint;
 pub use voice_print::{generate_agent_keypair, AgentKeypair, VoicePrint};
 pub use causal_position::{CausalPosition, NamespaceId};
+pub use edit_mode::EditMode;
 pub use genesis::{GenesisCommitment, GenesisEvent, GenesisTuple, WitnessType};
 pub use node_identity::{NodeIdentity, TopologicalPosition};
 pub use node_signature::{NodeSignature, WriteError};
