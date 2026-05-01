@@ -24,6 +24,7 @@ pub mod fabric_trait;
 pub mod bridge_fabric;
 pub mod mechanical;
 pub mod semantic;
+pub mod subscription;
 
 pub use fabric_trait::Fabric as FabricTrait;
 pub use bridge_fabric::BridgeFabric;
@@ -31,4 +32,8 @@ pub use mechanical::EditReceipt;
 pub use semantic::{
     CheckoutHandle, CheckoutStatus, ConsensusSnapshot, ProposalHandle, ProposalStatus,
     SemanticEditConfig,
+};
+pub use subscription::{
+    Callback, CallbackResult, DispatchConfig, ObserverContext, Predicate, SubscribeError,
+    SubscriptionId, SubscriptionState,
 };

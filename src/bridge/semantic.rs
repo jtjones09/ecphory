@@ -106,6 +106,10 @@ pub struct ConsensusSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct CheckoutEntry {
     pub target: LineageId,
+    /// Surfaced to subscribers and to debug endpoints. The pattern-match
+    /// engine keys on the materialized Checkout node's metadata, not on
+    /// this in-memory copy, so the field is held but not read in v1.
+    #[allow(dead_code)]
     pub rationale: String,
     /// Read by Step 4 (subscriptions) and Spec 6 immune system to
     /// baseline who is opening checkouts in which region.

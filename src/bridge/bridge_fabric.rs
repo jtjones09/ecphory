@@ -35,6 +35,11 @@ use super::semantic::{
     FinalizeOutcome, ProposalEntry, ProposalHandle, ProposalRegisterError, ProposalStatus,
     SemanticEditConfig, SemanticStateTable,
 };
+use super::subscription::{
+    Callback, DispatchConfig, DispatchPool, Predicate, SubscribeError, SubscriptionId,
+    SubscriptionRegistry, SubscriptionState,
+};
+use std::sync::atomic::Ordering;
 
 /// Inner state of the bridge fabric. All mutations go through the
 /// outer `RwLock` on `BridgeFabric`.
@@ -61,6 +66,7 @@ impl FabricState {
 /// - A `MechanicalLockTable` for per-node locks on `Mechanical` edits.
 /// - A `SemanticStateTable` for the checkout/proposal/snapshot machine.
 /// - `SemanticEditConfig` for tunable knobs.
+/// - A `SubscriptionRegistry` plus `DispatchPool` (Spec 8 §6 + §2.6.1).
 pub struct BridgeFabric {
     state: Arc<RwLock<FabricState>>,
     mechanical_locks: MechanicalLockTable,
@@ -69,6 +75,9 @@ pub struct BridgeFabric {
     /// Default namespace used when callers don't specify one. Matches
     /// the existing `Fabric::add_node` behavior.
     default_namespace: NamespaceId,
+    pub(crate) subscriptions: SubscriptionRegistry,
+    dispatch_pool: DispatchPool,
+    dispatch_config: DispatchConfig,
 }
 
 impl BridgeFabric {
@@ -81,12 +90,63 @@ impl BridgeFabric {
     /// a fabric that already has persistence, embedder, or genesis
     /// installed.
     pub fn wrap(inner: InnerFabric) -> Self {
+        Self::wrap_with_dispatch(inner, DispatchConfig::default())
+    }
+
+    /// Wrap with a custom dispatch configuration (worker count,
+    /// lagged threshold, retry backoff). Lets tests pin worker count
+    /// to 2 for predictable behavior.
+    pub fn wrap_with_dispatch(inner: InnerFabric, dispatch: DispatchConfig) -> Self {
         Self {
             state: Arc::new(RwLock::new(FabricState::new(inner))),
             mechanical_locks: MechanicalLockTable::new(),
             semantic_state: SemanticStateTable::new(),
             semantic_config: SemanticEditConfig::default(),
             default_namespace: NamespaceId::default_namespace(),
+            // 65,536 subscription cap is permissive for v1; tighten in v2.
+            subscriptions: SubscriptionRegistry::new(65_536),
+            dispatch_pool: DispatchPool::new(dispatch),
+            dispatch_config: dispatch,
+        }
+    }
+
+    /// Stop the dispatch pool cleanly. Idempotent — `Drop` calls this
+    /// too.
+    pub fn shutdown(&self) {
+        self.dispatch_pool.shutdown();
+    }
+
+    /// Internal: dispatch a freshly-committed node to all matching
+    /// subscriptions. Pattern matching happens synchronously on the
+    /// caller thread (cheap); callbacks run on the pool. Backpressure:
+    /// subscribers whose queue depth exceeds the lagged threshold are
+    /// marked `Lagged` and skip individual matches until the queue
+    /// drains (Spec 8 §6.B.4).
+    fn dispatch_to_subscribers(&self, node: &IntentNode) {
+        let snapshot = self.subscriptions.snapshot();
+        if snapshot.is_empty() {
+            return;
+        }
+        let lagged_threshold = self.dispatch_config.lagged_threshold;
+        for entry in snapshot {
+            if !(entry.pattern)(node) {
+                continue;
+            }
+            let depth = entry.queue_depth.load(Ordering::Relaxed);
+            if depth >= lagged_threshold {
+                // Mark lagged once; subsequent matches are silently
+                // skipped until the queue drains. Spec 8 §6.B.4 calls
+                // for a single Lagged summary event — Step 5
+                // (observability) emits a tracing event for it.
+                if !entry.lagged.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "[ecphory::subscription] subscription_lagged id={} depth={}",
+                        entry.id, depth
+                    );
+                }
+                continue;
+            }
+            let _ = self.dispatch_pool.enqueue(entry, node.clone());
         }
     }
 
@@ -128,11 +188,21 @@ impl FabricTrait for BridgeFabric {
         edit_mode: EditMode,
         signer: Option<&AgentKeypair>,
     ) -> Result<LineageId, WriteError> {
-        // Acquire the write lock for the duration of the create.
-        let mut guard = self.state.write().expect("FabricState poisoned");
-        let lineage_id =
-            guard.inner.create(content, &self.default_namespace, signer)?;
-        guard.edit_modes.insert(lineage_id.clone(), edit_mode);
+        // Acquire the write lock briefly. We clone the freshly-stored
+        // node out of the lock so dispatch can run without holding it.
+        let (lineage_id, dispatched_node) = {
+            let mut guard = self.state.write().expect("FabricState poisoned");
+            let lineage_id =
+                guard.inner.create(content, &self.default_namespace, signer)?;
+            guard.edit_modes.insert(lineage_id.clone(), edit_mode);
+            let node_snapshot = guard
+                .inner
+                .get_node(&lineage_id)
+                .cloned()
+                .expect("just-created node must be present");
+            (lineage_id, node_snapshot)
+        };
+        self.dispatch_to_subscribers(&dispatched_node);
         Ok(lineage_id)
     }
 
@@ -185,7 +255,7 @@ impl FabricTrait for BridgeFabric {
 
         // Lock held — do the edit under the outer write lock. Release
         // the per-node lock no matter what (panic-safe via guard).
-        let result = (|| -> Result<EditReceipt, WriteError> {
+        let outcome: Result<(EditReceipt, IntentNode), WriteError> = (|| {
             let mut guard = self.state.write().expect("FabricState poisoned");
             let previous_fingerprint = *guard
                 .inner
@@ -200,23 +270,29 @@ impl FabricTrait for BridgeFabric {
                 .mutate_node(target, mutation)
                 .map_err(|e| WriteError::FabricInternal(format!("inner mutate_node: {}", e)))?;
 
-            let new_fingerprint = *guard
+            let mutated = guard
                 .inner
                 .get_node(target)
                 .expect("present after successful mutate_node")
-                .content_fingerprint();
+                .clone();
+            let new_fingerprint = *mutated.content_fingerprint();
 
-            Ok(EditReceipt {
-                target: target.clone(),
-                previous_content_fingerprint: previous_fingerprint,
-                new_content_fingerprint: new_fingerprint,
-                editor_voice: signer.voice_print(),
-                commit_instant: FabricInstant::now(),
-            })
+            Ok((
+                EditReceipt {
+                    target: target.clone(),
+                    previous_content_fingerprint: previous_fingerprint,
+                    new_content_fingerprint: new_fingerprint,
+                    editor_voice: signer.voice_print(),
+                    commit_instant: FabricInstant::now(),
+                },
+                mutated,
+            ))
         })();
 
         self.mechanical_locks.release(target);
-        result
+        let (receipt, mutated) = outcome?;
+        self.dispatch_to_subscribers(&mutated);
+        Ok(receipt)
     }
 
     fn checkout(
@@ -269,19 +345,27 @@ impl FabricTrait for BridgeFabric {
 
         // Materialize the Checkout node with stable metadata.
         let checkout_node = build_checkout_node(target, &rationale, signer);
-        let checkout_id = {
+        let (checkout_id, dispatched_node) = {
             let mut guard = self.state.write().expect("FabricState poisoned");
             let id = guard.inner.create(checkout_node, &self.default_namespace, Some(signer))?;
             guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
-            id
+            let stored = guard
+                .inner
+                .get_node(&id)
+                .cloned()
+                .expect("just-created Checkout node must be present");
+            (id, stored)
         };
 
         match self.semantic_state.try_register_checkout(checkout_id.clone(), entry) {
-            Ok(()) => Ok(CheckoutHandle {
-                id: checkout_id,
-                target: target.clone(),
-                status: CheckoutStatus::Open,
-            }),
+            Ok(()) => {
+                self.dispatch_to_subscribers(&dispatched_node);
+                Ok(CheckoutHandle {
+                    id: checkout_id,
+                    target: target.clone(),
+                    status: CheckoutStatus::Open,
+                })
+            }
             Err(()) => Err(WriteError::SnapshotInProgress),
         }
     }
@@ -315,12 +399,17 @@ impl FabricTrait for BridgeFabric {
             }
         };
 
-        let proposal_id = {
+        let (proposal_id, proposal_snapshot) = {
             let mut guard = self.state.write().expect("FabricState poisoned");
             let id =
                 guard.inner.create(content, &self.default_namespace, Some(signer))?;
             guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
-            id
+            let stored = guard
+                .inner
+                .get_node(&id)
+                .cloned()
+                .expect("just-created Proposal node must be present");
+            (id, stored)
         };
 
         let entry = ProposalEntry {
@@ -333,11 +422,14 @@ impl FabricTrait for BridgeFabric {
             .semantic_state
             .register_proposal(proposal_id.clone(), target, checkout.clone(), entry)
         {
-            Ok(_predecessor) => Ok(ProposalHandle {
-                id: proposal_id,
-                checkout: checkout.clone(),
-                status: ProposalStatus::Draft,
-            }),
+            Ok(_predecessor) => {
+                self.dispatch_to_subscribers(&proposal_snapshot);
+                Ok(ProposalHandle {
+                    id: proposal_id,
+                    checkout: checkout.clone(),
+                    status: ProposalStatus::Draft,
+                })
+            }
             Err(ProposalRegisterError::CheckoutNotFound) => Err(WriteError::CheckoutExpired {
                 checkout: checkout.clone(),
             }),
@@ -390,17 +482,27 @@ impl FabricTrait for BridgeFabric {
                     })?;
 
                 let snapshot_node = build_snapshot_node(&target, &finalized_proposals);
-                let snapshot_id = {
+                let (snapshot_id, snapshot_snapshot) = {
                     let mut guard = self.state.write().expect("FabricState poisoned");
                     let id = guard
                         .inner
                         .create(snapshot_node, &self.default_namespace, None)?;
                     guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
-                    id
+                    let stored = guard
+                        .inner
+                        .get_node(&id)
+                        .cloned()
+                        .expect("just-created ConsensusSnapshot node must be present");
+                    (id, stored)
                 };
 
                 self.semantic_state
                     .release_snapshot_lock(&target, snapshot_id.clone());
+
+                // Dispatch the ConsensusSnapshot AFTER releasing the
+                // SnapshotLock so a subscriber that immediately opens a
+                // new checkout doesn't see SnapshotInProgress.
+                self.dispatch_to_subscribers(&snapshot_snapshot);
 
                 Ok(Some(ConsensusSnapshot {
                     id: snapshot_id,
@@ -425,6 +527,22 @@ impl FabricTrait for BridgeFabric {
     fn edit_mode_of(&self, id: &LineageId) -> Option<EditMode> {
         let guard = self.state.read().expect("FabricState poisoned");
         guard.edit_modes.get(id).copied()
+    }
+
+    fn subscribe(
+        &self,
+        pattern: Predicate,
+        callback: Callback,
+    ) -> Result<SubscriptionId, SubscribeError> {
+        self.subscriptions.add(pattern, callback)
+    }
+
+    fn unsubscribe(&self, id: SubscriptionId) -> Result<(), SubscribeError> {
+        self.subscriptions.remove(id)
+    }
+
+    fn subscription_state(&self, id: SubscriptionId) -> Option<SubscriptionState> {
+        self.subscriptions.state(id)
     }
 }
 
@@ -850,5 +968,240 @@ mod tests {
             .unwrap();
         let result = bridge.checkout(&id, "?".into(), Duration::from_secs(60), &agent);
         assert!(matches!(result.unwrap_err(), WriteError::EditModeMismatch { .. }));
+    }
+
+    // ── Subscriptions wired into the bridge (Spec 8 §6) ──
+
+    use crate::bridge::subscription::{Callback, CallbackResult, Predicate};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if check() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        check()
+    }
+
+    #[test]
+    fn subscribe_fires_on_create() {
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let count_for_cb = std::sync::Arc::clone(&count);
+
+        let pat: Predicate = std::sync::Arc::new(|node: &IntentNode| {
+            node.want.description.contains("important")
+        });
+        let cb: Callback = std::sync::Arc::new(move |_node, _ctx| {
+            count_for_cb.fetch_add(1, Ordering::SeqCst);
+            CallbackResult::Success
+        });
+        let _ = bridge.subscribe(pat, cb).unwrap();
+
+        // Match.
+        bridge
+            .create(
+                IntentNode::new("important note"),
+                EditMode::AppendOnly,
+                Some(&agent),
+            )
+            .unwrap();
+        // No match.
+        bridge
+            .create(IntentNode::new("trivial"), EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+        // Match.
+        bridge
+            .create(
+                IntentNode::new("very important reminder"),
+                EditMode::AppendOnly,
+                Some(&agent),
+            )
+            .unwrap();
+
+        assert!(
+            wait_until(Duration::from_secs(2), || count.load(Ordering::SeqCst) == 2),
+            "Expected 2 matches; got {}",
+            count.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn unsubscribe_stops_delivery() {
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let count_for_cb = std::sync::Arc::clone(&count);
+
+        let pat: Predicate = std::sync::Arc::new(|_| true);
+        let cb: Callback = std::sync::Arc::new(move |_node, _ctx| {
+            count_for_cb.fetch_add(1, Ordering::SeqCst);
+            CallbackResult::Success
+        });
+        let id = bridge.subscribe(pat, cb).unwrap();
+
+        bridge
+            .create(IntentNode::new("a"), EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(1), || count.load(
+            Ordering::SeqCst
+        ) >= 1));
+
+        bridge.unsubscribe(id).unwrap();
+
+        bridge
+            .create(IntentNode::new("b"), EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+        bridge
+            .create(IntentNode::new("c"), EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+
+        // Give the pool a moment to drain — count should remain at 1.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "After unsubscribe, no further deliveries should occur."
+        );
+    }
+
+    #[test]
+    fn callback_panic_does_not_disrupt_request_path() {
+        // Spec 8 §2.6.1: subscription panics never reach the request path.
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+        let pat: Predicate = std::sync::Arc::new(|_| true);
+        let cb: Callback = std::sync::Arc::new(|_node, _ctx| {
+            panic!("intentional test panic");
+        });
+        let id = bridge.subscribe(pat, cb).unwrap();
+
+        // The create call must return Ok regardless of the panicking callback.
+        let result = bridge.create(
+            IntentNode::new("triggers panic"),
+            EditMode::AppendOnly,
+            Some(&agent),
+        );
+        assert!(result.is_ok(), "create() must not be affected by callback panics");
+
+        // The callback should have been invoked and the panic counted.
+        // (We poll because dispatch is async.)
+        assert!(wait_until(Duration::from_secs(2), || {
+            bridge
+                .subscription_state(id)
+                .map(|s| s.panic_count >= 1)
+                .unwrap_or(false)
+        }), "Subscription panic_count should reach 1");
+    }
+
+    #[test]
+    fn lagged_threshold_marks_subscription_lagged() {
+        // Spec 8 §6.B.4: a subscription whose queue grows beyond the
+        // lagged threshold is marked Lagged and stops getting new
+        // matches enqueued individually until the queue drains.
+        //
+        // Strategy: build a bridge with worker_count=1, lagged_threshold=3
+        // and a slow callback. Pump 6 writes through; the first few
+        // queue (depth ≤ 3), the rest are skipped, so only ~3 ever fire.
+        let bridge = BridgeFabric::wrap_with_dispatch(
+            crate::fabric::Fabric::new(),
+            DispatchConfig {
+                worker_count: 1,
+                lagged_threshold: 3,
+                retry_backoff: Duration::from_millis(0),
+            },
+        );
+        let agent = generate_agent_keypair();
+        let invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let invocations_for_cb = std::sync::Arc::clone(&invocations);
+
+        let pat: Predicate = std::sync::Arc::new(|_| true);
+        let cb: Callback = std::sync::Arc::new(move |_node, _ctx| {
+            std::thread::sleep(Duration::from_millis(50));
+            invocations_for_cb.fetch_add(1, Ordering::SeqCst);
+            CallbackResult::Success
+        });
+        let id = bridge.subscribe(pat, cb).unwrap();
+
+        // Fire 8 writes back-to-back. Worker is slow; queue should
+        // saturate. Once depth reaches threshold (3), further writes
+        // are skipped — they don't get enqueued.
+        for i in 0..8 {
+            bridge
+                .create(
+                    IntentNode::new(format!("event {}", i)),
+                    EditMode::AppendOnly,
+                    Some(&agent),
+                )
+                .unwrap();
+        }
+
+        // Eventually the queue drains. We expect strictly fewer than 8
+        // invocations because some were skipped under backpressure.
+        let _ = wait_until(Duration::from_secs(3), || {
+            bridge
+                .subscription_state(id)
+                .map(|s| s.queue_depth == 0)
+                .unwrap_or(false)
+        });
+
+        let final_count = invocations.load(Ordering::SeqCst);
+        assert!(
+            final_count < 8,
+            "Lagged backpressure must skip some matches; got {} invocations for 8 writes",
+            final_count
+        );
+        assert!(
+            final_count >= 1,
+            "At least the early matches should have fired before lagged kicked in; got {}",
+            final_count
+        );
+    }
+
+    #[test]
+    fn subscription_fires_on_consensus_snapshot() {
+        // The ConsensusSnapshot node is itself dispatched to subscribers
+        // — it's a fabric-resident node like any other (Spec 8 §3.4.3,
+        // §6.5: cell-agent population subscribes to ConsensusSnapshot).
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+        let snapshot_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let count_for_cb = std::sync::Arc::clone(&snapshot_count);
+
+        let pat: Predicate = std::sync::Arc::new(|node: &IntentNode| {
+            node.metadata
+                .get(super::META_NODE_KIND)
+                .map(|v| v.as_str_repr() == super::KIND_CONSENSUS_SNAPSHOT)
+                .unwrap_or(false)
+        });
+        let cb: Callback = std::sync::Arc::new(move |_node, _ctx| {
+            count_for_cb.fetch_add(1, Ordering::SeqCst);
+            CallbackResult::Success
+        });
+        let _ = bridge.subscribe(pat, cb).unwrap();
+
+        let target = bridge
+            .create(IntentNode::new("PINNED"), EditMode::Semantic, Some(&agent))
+            .unwrap();
+        let co = bridge
+            .checkout(&target, "rev".into(), Duration::from_secs(60), &agent)
+            .unwrap();
+        let p = bridge
+            .propose(&co.id, IntentNode::new("revised"), &agent)
+            .unwrap();
+        let snap = bridge.finalize_proposal(&p.id, &agent).unwrap();
+        assert!(snap.is_some());
+
+        assert!(
+            wait_until(Duration::from_secs(2), || snapshot_count
+                .load(Ordering::SeqCst)
+                >= 1),
+            "Subscriber should observe the ConsensusSnapshot node"
+        );
     }
 }

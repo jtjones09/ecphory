@@ -4,12 +4,27 @@
 // no mocks, no shortcuts. The fabric runs in-process through the
 // `BridgeFabric` API.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use ecphory::bridge::{BridgeFabric, FabricTrait};
+use ecphory::bridge::{
+    BridgeFabric, Callback, CallbackResult, FabricTrait, Predicate,
+};
 use ecphory::{
     generate_agent_keypair, EditMode, IntentNode, MetadataValue, WriteError,
 };
+
+fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
+    let end = Instant::now() + deadline;
+    while Instant::now() < end {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    check()
+}
 
 // ── Step 2: identity primitives reach into the bridge ──
 
@@ -182,5 +197,149 @@ fn mechanical_lock_serializes_writers() {
         final_node.metadata.get("v"),
         Some(&MetadataValue::Int(2)),
         "Last writer's value persists (linearizable per-node)."
+    );
+}
+
+// ── Step 4: subscriptions, fault isolation, backpressure ──
+
+#[test]
+fn subscription_observes_create_through_bridge_trait() {
+    let bridge = BridgeFabric::new();
+    let agent = generate_agent_keypair();
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_cb = Arc::clone(&observed);
+
+    let pattern: Predicate = Arc::new(|node: &IntentNode| {
+        node.want.description.starts_with("audit:")
+    });
+    let cb: Callback = Arc::new(move |_node, _ctx| {
+        observed_cb.fetch_add(1, Ordering::SeqCst);
+        CallbackResult::Success
+    });
+    let _ = bridge.subscribe(pattern, cb).unwrap();
+
+    bridge
+        .create(
+            IntentNode::new("audit: log entry 1"),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    bridge
+        .create(
+            IntentNode::new("not-audit"),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    bridge
+        .create(
+            IntentNode::new("audit: log entry 2"),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(2), || observed.load(Ordering::SeqCst) == 2),
+        "Subscriber must see exactly the 2 audit entries; saw {}",
+        observed.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn callback_panic_does_not_propagate_to_caller() {
+    // Spec 8 §2.6.1: panics in subscription callbacks are caught and
+    // converted to SubscriptionPanic events. The caller of `create`
+    // never observes a panic.
+    let bridge = BridgeFabric::new();
+    let agent = generate_agent_keypair();
+    let pat: Predicate = Arc::new(|_| true);
+    let cb: Callback = Arc::new(|_node, _ctx| panic!("test panic"));
+    let id = bridge.subscribe(pat, cb).unwrap();
+
+    // Multiple writes — none of them should propagate the panic.
+    for i in 0..3 {
+        let result = bridge.create(
+            IntentNode::new(format!("write {}", i)),
+            EditMode::AppendOnly,
+            Some(&agent),
+        );
+        assert!(
+            result.is_ok(),
+            "Write {} must succeed regardless of subscription panic",
+            i
+        );
+    }
+
+    assert!(wait_until(Duration::from_secs(2), || {
+        bridge
+            .subscription_state(id)
+            .map(|s| s.panic_count >= 3)
+            .unwrap_or(false)
+    }), "All three panics should be counted on the subscription state");
+}
+
+#[test]
+fn slow_subscriber_does_not_block_request_path() {
+    // The dispatch pool runs callbacks off the request path (Spec 8
+    // §2.6.1, §6.B.2). A slow callback must not delay the writer.
+    let bridge = BridgeFabric::new();
+    let agent = generate_agent_keypair();
+    let pat: Predicate = Arc::new(|_| true);
+    let cb: Callback = Arc::new(|_node, _ctx| {
+        std::thread::sleep(Duration::from_millis(500));
+        CallbackResult::Success
+    });
+    let _ = bridge.subscribe(pat, cb).unwrap();
+
+    let start = Instant::now();
+    bridge
+        .create(
+            IntentNode::new("write that triggers a slow subscriber"),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    let elapsed = start.elapsed();
+    // The write should return well before the 500ms sleep finishes.
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "Write returned in {:?}; must not wait on the dispatch pool's slow callback",
+        elapsed
+    );
+}
+
+#[test]
+fn unsubscribe_terminates_delivery() {
+    let bridge = BridgeFabric::new();
+    let agent = generate_agent_keypair();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_for_cb = Arc::clone(&count);
+
+    let pat: Predicate = Arc::new(|_| true);
+    let cb: Callback = Arc::new(move |_node, _ctx| {
+        count_for_cb.fetch_add(1, Ordering::SeqCst);
+        CallbackResult::Success
+    });
+    let id = bridge.subscribe(pat, cb).unwrap();
+
+    bridge
+        .create(IntentNode::new("first"), EditMode::AppendOnly, Some(&agent))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(1), || count.load(
+        Ordering::SeqCst
+    ) >= 1));
+
+    bridge.unsubscribe(id).unwrap();
+
+    bridge
+        .create(IntentNode::new("after-unsub"), EditMode::AppendOnly, Some(&agent))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "After unsubscribe, no further callbacks should fire."
     );
 }

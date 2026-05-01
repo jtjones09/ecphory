@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use super::mechanical::EditReceipt;
 use super::semantic::{CheckoutHandle, ConsensusSnapshot, ProposalHandle};
+use super::subscription::{Callback, Predicate, SubscribeError, SubscriptionId, SubscriptionState};
 
 /// The Phase F bridge surface (Spec 8 §7). All write methods take
 /// `&self` — interior mutability is the implementation's concern.
@@ -102,4 +103,26 @@ pub trait Fabric: Send + Sync {
 
     /// What `EditMode` was the node tagged with at create time?
     fn edit_mode_of(&self, id: &LineageId) -> Option<EditMode>;
+
+    // ── Spec 8 §6 — subscriptions ──
+
+    /// Register a persistent attention. The fabric evaluates `pattern`
+    /// against every node it commits; on match, `callback` runs on the
+    /// dispatch pool — never on the request path. Panics in the
+    /// callback are caught at the dispatch boundary (Spec 8 §2.6.1).
+    fn subscribe(
+        &self,
+        pattern: Predicate,
+        callback: Callback,
+    ) -> Result<SubscriptionId, SubscribeError>;
+
+    /// Cancel a previously registered subscription. In-flight callbacks
+    /// already on the dispatch pool finish; future matches are not
+    /// delivered.
+    fn unsubscribe(&self, id: SubscriptionId) -> Result<(), SubscribeError>;
+
+    /// Snapshot of a subscription's runtime state — queue depth,
+    /// observation count, panic count, lagged status. Surfaced via
+    /// `/debug/fabric/subscriptions` per Spec 8 §8.5.3.
+    fn subscription_state(&self, id: SubscriptionId) -> Option<SubscriptionState>;
 }
