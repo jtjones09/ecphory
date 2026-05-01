@@ -21,6 +21,7 @@ pub mod signature;
 pub mod confidence;
 pub mod constraint;
 pub mod context;
+pub mod identity;
 pub mod node;
 pub mod temporal;
 pub mod tracer;
@@ -49,4 +50,11 @@ pub use distributed::{
     Conflict, ConflictStrategy, Resolution, resolve_conflict, select_strategy,
     GossipState, GossipMessage, Digest, DigestEntry, NodeTransfer,
     Transport, LocalTransport, Envelope,
+};
+pub use identity::{
+    AgentKeypair, AgentRelation, CausalPosition, ConflictingSignal, ContentFingerprint,
+    CrossAttestation, FabricQuestion, GenesisCommitment, GenesisEvent, GenesisTuple,
+    NamespaceId, NodeIdentity, NodeQuarantineState, NodeSignature, QuarantineReason,
+    RegionSensitivity, SignalType, TopologicalPosition, TrustWeight, VoicePrint,
+    WitnessType, WriteError, generate_agent_keypair,
 };

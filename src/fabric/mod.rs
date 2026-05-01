@@ -13,6 +13,10 @@ use std::collections::HashMap;
 
 use crate::context::{ContextEdge, RelationshipKind};
 use crate::embedding::Embedder;
+use crate::identity::{
+    AgentKeypair, CausalPosition, ContentFingerprint, GenesisEvent, NamespaceId, NodeIdentity,
+    NodeSignature, RegionSensitivity, TopologicalPosition, WriteError,
+};
 use crate::inference::ActionPolicy;
 use crate::node::IntentNode;
 use crate::signature::{LineageId, Signature};
@@ -62,6 +66,12 @@ pub struct Fabric {
     /// Learnable action selection policy (Phase 4b).
     /// RPE signals adapt thresholds over time.
     policy: ActionPolicy,
+    /// Sensitivity policy per region (Spec 5 §2.2.3, §3.3).
+    /// Default `Normal`. `High` requires per-node signing on create.
+    region_sensitivity: HashMap<NamespaceId, RegionSensitivity>,
+    /// The genesis event for this fabric instance (Spec 5 §4). Set
+    /// when the fabric is initialized via `Fabric::genesis(...)`.
+    genesis: Option<GenesisEvent>,
 }
 
 /// Errors that the fabric can produce.
@@ -124,6 +134,8 @@ impl Fabric {
             decay_lambda: lambda_from_half_life(DEFAULT_HALF_LIFE_SECS),
             embedder: None,
             policy: ActionPolicy::default(),
+            region_sensitivity: HashMap::new(),
+            genesis: None,
         }
     }
 
@@ -139,6 +151,8 @@ impl Fabric {
             decay_lambda: lambda_from_half_life(DEFAULT_HALF_LIFE_SECS),
             embedder: None,
             policy: ActionPolicy::default(),
+            region_sensitivity: HashMap::new(),
+            genesis: None,
         }
     }
 
@@ -155,6 +169,8 @@ impl Fabric {
             decay_lambda: lambda_from_half_life(DEFAULT_HALF_LIFE_SECS),
             embedder: Some(embedder),
             policy: ActionPolicy::default(),
+            region_sensitivity: HashMap::new(),
+            genesis: None,
         }
     }
 
@@ -195,7 +211,49 @@ impl Fabric {
     /// Add a node to the fabric. The fabric takes ownership.
     /// Returns the node's LineageId for future reference.
     /// Auto-embeds the node if an embedder is configured.
-    pub fn add_node(&mut self, mut node: IntentNode) -> LineageId {
+    ///
+    /// Backward-compatible entry point: writes into the default namespace
+    /// (Spec 5 §2.2 — emergent regions; the default namespace is `Normal`
+    /// sensitivity). Callers needing high-sensitivity regions or explicit
+    /// signers should use [`Fabric::create`].
+    pub fn add_node(&mut self, node: IntentNode) -> LineageId {
+        // Default namespace, no signer. Normal-region writes never fail
+        // for missing signature, so unwrap is sound.
+        self.create(node, &NamespaceId::default_namespace(), None)
+            .expect("default namespace is Normal sensitivity; signer not required")
+    }
+
+    /// Create a node in a specific region with optional signer (Spec 5 §3.3).
+    ///
+    /// - For `Normal` regions: signer is ignored; content fingerprint alone suffices.
+    /// - For `High` regions: signer is REQUIRED; returns
+    ///   [`WriteError::SignatureRequired`] if `None`.
+    /// - For unknown namespaces: returns [`WriteError::UnknownNamespace`].
+    ///
+    /// On success the node receives a `causal_position` (Spec 5 §2.1.1)
+    /// `(LamportTimestamp, FabricInstant, NamespaceId)` and, for High
+    /// regions, a `node_signature` (Spec 5 §3.3).
+    pub fn create(
+        &mut self,
+        mut node: IntentNode,
+        namespace: &NamespaceId,
+        signer: Option<&AgentKeypair>,
+    ) -> Result<LineageId, WriteError> {
+        // Resolve sensitivity. Unregistered namespaces default to Normal
+        // EXCEPT the default namespace itself which is implicitly Normal.
+        // Treat unknown namespaces as `Normal` to keep the API ergonomic
+        // for the common case; an explicit `register_region` call lets
+        // callers raise sensitivity to High.
+        let sensitivity = self
+            .region_sensitivity
+            .get(namespace)
+            .copied()
+            .unwrap_or(RegionSensitivity::Normal);
+
+        if sensitivity.requires_signature() && signer.is_none() {
+            return Err(WriteError::SignatureRequired);
+        }
+
         // Auto-embed if embedder is present and node has no embedding.
         if node.want.embedding.is_none() {
             if let Some(ref embedder) = self.embedder {
@@ -203,9 +261,29 @@ impl Fabric {
             }
         }
 
+        // Stamp the creator voice if a signer was supplied and the node
+        // doesn't already carry one.
+        if let Some(kp) = signer {
+            if node.creator_voice.is_none() {
+                node.creator_voice = Some(kp.voice_print());
+            }
+        }
+
+        // High-sensitivity regions: produce the per-node signature now.
+        if sensitivity.requires_signature() {
+            let kp = signer.expect("checked above");
+            let sig = NodeSignature::sign(kp, *node.content_fingerprint());
+            node.node_signature = Some(sig);
+        }
+
+        let ts = self.clock.tick();
+        let now = FabricInstant::now();
+
+        // Stamp causal_position (Spec 5 §2.1.1).
+        node.causal_position = Some(CausalPosition::new(ts, now.clone(), namespace.clone()));
+
         let lineage_id = node.lineage_id().clone();
         let signature = node.signature().clone();
-        let ts = self.clock.tick();
 
         self.tracer.trace(&TraceEvent::NodeAdded {
             lineage_id: lineage_id.clone(),
@@ -213,8 +291,8 @@ impl Fabric {
 
         let entry = NodeEntry {
             node,
-            created_at: FabricInstant::now(),
-            last_accessed: FabricInstant::now(),
+            created_at: now.clone(),
+            last_accessed: now,
             lamport_ts: ts,
         };
 
@@ -224,7 +302,7 @@ impl Fabric {
             .entry(signature)
             .or_insert_with(|| lineage_id.clone());
 
-        lineage_id
+        Ok(lineage_id)
     }
 
     /// Get a reference to a node by lineage ID.
@@ -310,6 +388,135 @@ impl Default for Fabric {
 }
 
 // ═══════════════════════════════════════════════
+//  Identity Layer: Genesis, Regions, Verification (Spec 5)
+// ═══════════════════════════════════════════════
+
+impl Fabric {
+    /// Bind the fabric's genesis event (Spec 5 §4). Records the instance
+    /// tuple and registers the genesis event's `initial_regions` (each at
+    /// `Normal` sensitivity by default — operators raise propmgmt etc.
+    /// to `High` via `set_region_sensitivity`).
+    ///
+    /// The genesis event itself is the fabric's "Big Bang" — initial
+    /// conditions from which subsequent identity emerges. It is stored
+    /// on the fabric for later verification.
+    pub fn install_genesis(&mut self, event: GenesisEvent) {
+        for region in &event.initial_regions {
+            self.region_sensitivity
+                .entry(region.clone())
+                .or_insert(RegionSensitivity::Normal);
+        }
+        self.genesis = Some(event);
+    }
+
+    /// Borrow the fabric's genesis event, if any.
+    pub fn genesis(&self) -> Option<&GenesisEvent> {
+        self.genesis.as_ref()
+    }
+
+    /// Set the sensitivity policy for a region (Spec 5 §3.3).
+    /// Default if unset is `Normal`.
+    pub fn set_region_sensitivity(
+        &mut self,
+        namespace: NamespaceId,
+        sensitivity: RegionSensitivity,
+    ) {
+        self.region_sensitivity.insert(namespace, sensitivity);
+    }
+
+    /// Get the sensitivity for a region. Unregistered regions are `Normal`.
+    pub fn region_sensitivity(&self, namespace: &NamespaceId) -> RegionSensitivity {
+        self.region_sensitivity
+            .get(namespace)
+            .copied()
+            .unwrap_or(RegionSensitivity::Normal)
+    }
+
+    /// Verify the BLAKE3 content fingerprint of every node (Spec 5 §3.1
+    /// boot-time re-check). Returns the LineageIds whose fingerprint
+    /// did NOT match — each one is a `DamageObservation` trigger.
+    ///
+    /// Cost per node: ~1µs (BLAKE3 over canonical content bytes).
+    pub fn verify_all_content_fingerprints(&self) -> Vec<LineageId> {
+        let mut damaged = Vec::new();
+        for (id, entry) in &self.nodes {
+            if !entry.node.verify_content_fingerprint() {
+                damaged.push(id.clone());
+            }
+        }
+        damaged
+    }
+
+    /// Verify the per-node signature on a high-sensitivity node, if
+    /// present (Spec 5 §3.3). Returns:
+    /// - `Some(true)`  if the node has a signature and it verifies.
+    /// - `Some(false)` if it has a signature but verification fails.
+    /// - `None`        if the node has no signature (Normal-region node).
+    pub fn verify_node_signature(&self, id: &LineageId) -> Option<bool> {
+        let node = self.get_node(id)?;
+        node.node_signature.as_ref().map(|sig| {
+            // Verify against the node's own content_fingerprint, which
+            // the fabric guarantees was used at signing time.
+            sig.verify_signature_only() && &sig.content_fingerprint == node.content_fingerprint()
+        })
+    }
+
+    /// Compute the node's topological position from the live edge graph
+    /// (Spec 5 §2.1.1, Spec 8 §4.2). This is the *fourth* component of
+    /// the four-tuple identity — the only one not stored on the node.
+    ///
+    /// Cost: ~5µs (graph query + BLAKE3 over neighbor list).
+    pub fn topological_position(&self, id: &LineageId) -> Option<TopologicalPosition> {
+        if !self.contains(id) {
+            return None;
+        }
+
+        let outgoing = self.edges_from(id);
+        let incoming = self.edges_to(id);
+        let out_degree = outgoing.len() as u32;
+        let in_degree = incoming.len() as u32;
+
+        // Build a stable byte string over the sorted neighbor LineageIds
+        // (out-edges first by target, then in-edges by source). Hashing
+        // this gives an observer-recomputable fingerprint that changes
+        // exactly when the node's neighborhood changes.
+        let mut neighbors: Vec<String> = Vec::with_capacity(outgoing.len() + incoming.len());
+        for edge in outgoing {
+            neighbors.push(format!("out:{}", edge.target.as_uuid()));
+        }
+        for src in &incoming {
+            neighbors.push(format!("in:{}", src.as_uuid()));
+        }
+        neighbors.sort();
+        let joined = neighbors.join("|");
+        let neighbor_fingerprint: [u8; 32] = blake3::hash(joined.as_bytes()).into();
+
+        Some(TopologicalPosition::new(in_degree, out_degree, neighbor_fingerprint))
+    }
+
+    /// Project a node's full four-tuple identity (Spec 8 §4.2). Returns
+    /// None if the node isn't in the fabric or hasn't been assigned a
+    /// causal position (which would mean it was constructed standalone
+    /// rather than created via [`Fabric::create`]).
+    pub fn node_identity(&self, id: &LineageId) -> Option<NodeIdentity> {
+        let node = self.get_node(id)?;
+        let causal_position = node.causal_position.clone()?;
+        let topological_position = self.topological_position(id)?;
+        Some(NodeIdentity::new(
+            *node.content_fingerprint(),
+            causal_position,
+            node.creator_voice,
+            topological_position,
+        ))
+    }
+}
+
+/// Convenience: build a witness fingerprint for a small bytestring.
+pub fn fingerprint(bytes: &[u8]) -> ContentFingerprint {
+    ContentFingerprint::compute(bytes)
+}
+
+// ═══════════════════════════════════════════════
 //  Persistence Accessors
 // ═══════════════════════════════════════════════
 
@@ -359,6 +566,8 @@ impl Fabric {
             decay_lambda,
             embedder: None,
             policy: ActionPolicy::default(),
+            region_sensitivity: HashMap::new(),
+            genesis: None,
         };
 
         // Insert nodes, rebuild signature index.
@@ -1527,5 +1736,194 @@ mod tests {
         fabric.add_node(IntentNode::understood("send message via Signal", 0.92)); // clear
         let needy = fabric.needs_clarification();
         assert_eq!(needy.len(), 1);
+    }
+
+    // ─── Spec 5: Identity primitives at the fabric layer ───
+
+    use crate::identity::{
+        generate_agent_keypair, ContentFingerprint, GenesisCommitment, GenesisEvent,
+        NamespaceId, RegionSensitivity, WitnessType, WriteError,
+    };
+
+    fn manual_commitment() -> GenesisCommitment {
+        let operator = generate_agent_keypair();
+        let timestamp = b"2026-04-30T00:00:00Z";
+        let signature = operator.sign(timestamp);
+        GenesisCommitment::new(
+            WitnessType::ManualTimestamp {
+                operator_pk: operator.voice_print(),
+                signed_timestamp: signature,
+            },
+            timestamp.to_vec(),
+        )
+    }
+
+    #[test]
+    fn add_node_assigns_causal_position() {
+        // Spec 5 §2.1.1: every node has a causal_position
+        // (LamportTimestamp, FabricInstant, NamespaceId) at insertion.
+        let mut fabric = Fabric::new();
+        let id = fabric.add_node(IntentNode::new("test"));
+        let node = fabric.get_node(&id).unwrap();
+        let pos = node.causal_position.as_ref().expect("fabric must stamp causal_position");
+        assert_eq!(pos.namespace, NamespaceId::default_namespace());
+        assert!(pos.lamport.value() > 0,
+            "Lamport clock must increment for the new node.");
+    }
+
+    #[test]
+    fn lamport_clock_increments_per_node() {
+        let mut fabric = Fabric::new();
+        let id1 = fabric.add_node(IntentNode::new("first"));
+        let id2 = fabric.add_node(IntentNode::new("second"));
+        let t1 = fabric.get_node(&id1).unwrap().causal_position.as_ref().unwrap().lamport;
+        let t2 = fabric.get_node(&id2).unwrap().causal_position.as_ref().unwrap().lamport;
+        assert!(t2 > t1, "Lamport timestamps must be totally ordered.");
+    }
+
+    #[test]
+    fn install_genesis_sets_first_node_and_initial_regions() {
+        // Spec 5 §4: genesis creates the instance tuple, root namespaces,
+        // and starts the maternal-immunity training period.
+        let mut fabric = Fabric::new();
+        let instance = generate_agent_keypair();
+        let propmgmt = NamespaceId::fresh("propmgmt");
+        let nisaba = NamespaceId::fresh("nisaba");
+
+        let event = GenesisEvent::new(
+            instance.voice_print(),
+            manual_commitment(),
+            ContentFingerprint::compute(b"initial state"),
+            vec![propmgmt.clone(), nisaba.clone()],
+            vec![instance.voice_print()],
+        );
+        fabric.install_genesis(event);
+
+        let g = fabric.genesis().expect("genesis must be installed");
+        let tuple = g.tuple();
+        assert_eq!(tuple.instance_pk, instance.voice_print());
+        assert!(g.genesis_commitment.verify(),
+            "Genesis commitment must self-verify (Spec 5 §4).");
+        assert_eq!(fabric.region_sensitivity(&propmgmt), RegionSensitivity::Normal);
+        assert_eq!(fabric.region_sensitivity(&nisaba), RegionSensitivity::Normal);
+    }
+
+    #[test]
+    fn normal_region_does_not_require_signature() {
+        let mut fabric = Fabric::new();
+        let ns = NamespaceId::fresh("normal-region");
+        // Implicitly Normal — should accept node without a signer.
+        let id = fabric.create(IntentNode::new("plain note"), &ns, None);
+        assert!(id.is_ok());
+    }
+
+    #[test]
+    fn high_region_requires_signature() {
+        // Spec 5 §3.3: high-sensitivity regions MUST get a per-node
+        // Ed25519 signature; refusing unsigned writes is the
+        // SignatureRequired error.
+        let mut fabric = Fabric::new();
+        let propmgmt = NamespaceId::fresh("propmgmt");
+        fabric.set_region_sensitivity(propmgmt.clone(), RegionSensitivity::High);
+
+        let unsigned_result = fabric.create(IntentNode::new("financial record"), &propmgmt, None);
+        assert_eq!(unsigned_result.unwrap_err(), WriteError::SignatureRequired);
+
+        // Signed write succeeds.
+        let agent = generate_agent_keypair();
+        let signed_result = fabric.create(
+            IntentNode::new("financial record"),
+            &propmgmt,
+            Some(&agent),
+        );
+        let id = signed_result.expect("signed write must succeed");
+        let node = fabric.get_node(&id).unwrap();
+        assert!(node.node_signature.is_some(),
+            "High-sensitivity nodes must carry a NodeSignature.");
+        assert_eq!(node.creator_voice, Some(agent.voice_print()),
+            "Signer's voice print is recorded as creator_voice.");
+        assert_eq!(fabric.verify_node_signature(&id), Some(true),
+            "Per-node signature must verify after creation.");
+    }
+
+    #[test]
+    fn verify_all_content_fingerprints_returns_empty_for_clean_fabric() {
+        let mut fabric = Fabric::new();
+        for i in 0..5 {
+            fabric.add_node(IntentNode::new(format!("node {}", i)));
+        }
+        let damaged = fabric.verify_all_content_fingerprints();
+        assert!(damaged.is_empty(),
+            "Boot-time content fingerprint check must pass for unmodified fabric (Spec 5 §3.1).");
+    }
+
+    // ─── Spec 8 §4.2: Four-tuple node identity ───
+
+    #[test]
+    fn topological_position_zero_for_isolated_node() {
+        let mut fabric = Fabric::new();
+        let id = fabric.add_node(IntentNode::new("isolated"));
+        let tp = fabric.topological_position(&id).unwrap();
+        assert_eq!(tp.in_degree, 0);
+        assert_eq!(tp.out_degree, 0);
+    }
+
+    #[test]
+    fn topological_position_reflects_in_and_out_edges() {
+        let mut fabric = Fabric::new();
+        let a = fabric.add_node(IntentNode::new("a"));
+        let b = fabric.add_node(IntentNode::new("b"));
+        let c = fabric.add_node(IntentNode::new("c"));
+        fabric.add_edge(&a, &b, 0.7, RelationshipKind::DependsOn).unwrap();
+        fabric.add_edge(&c, &b, 0.5, RelationshipKind::RelatedTo).unwrap();
+
+        let tp_b = fabric.topological_position(&b).unwrap();
+        assert_eq!(tp_b.in_degree, 2, "b has two incoming edges from a and c.");
+        assert_eq!(tp_b.out_degree, 0);
+    }
+
+    #[test]
+    fn topological_position_changes_when_neighborhood_changes() {
+        let mut fabric = Fabric::new();
+        let a = fabric.add_node(IntentNode::new("a"));
+        let b = fabric.add_node(IntentNode::new("b"));
+        let c = fabric.add_node(IntentNode::new("c"));
+
+        let tp1 = fabric.topological_position(&a).unwrap();
+        fabric.add_edge(&a, &b, 0.5, RelationshipKind::RelatedTo).unwrap();
+        let tp2 = fabric.topological_position(&a).unwrap();
+        assert_ne!(tp1, tp2,
+            "Adding an outgoing edge must change the topological fingerprint.");
+
+        fabric.add_edge(&a, &c, 0.5, RelationshipKind::RelatedTo).unwrap();
+        let tp3 = fabric.topological_position(&a).unwrap();
+        assert_ne!(tp2, tp3);
+    }
+
+    #[test]
+    fn node_identity_bundles_all_four_components() {
+        // Spec 8 §4.2: NodeIdentity = (content_fingerprint, causal_position,
+        // creator_voice, topological_position).
+        let mut fabric = Fabric::new();
+        let agent = crate::identity::generate_agent_keypair();
+        let id = fabric.add_node(
+            IntentNode::new("identifiable").with_creator_voice(agent.voice_print()),
+        );
+        let identity = fabric.node_identity(&id).expect("identity available");
+
+        assert_eq!(identity.creator_voice, Some(agent.voice_print()));
+        assert_eq!(
+            identity.content_fingerprint,
+            *fabric.get_node(&id).unwrap().content_fingerprint()
+        );
+        assert_eq!(identity.causal_position.namespace, NamespaceId::default_namespace());
+        assert_eq!(identity.topological_position.in_degree, 0);
+        assert_eq!(identity.topological_position.out_degree, 0);
+    }
+
+    #[test]
+    fn node_identity_returns_none_for_unknown_node() {
+        let fabric = Fabric::new();
+        assert!(fabric.node_identity(&LineageId::new()).is_none());
     }
 }

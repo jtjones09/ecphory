@@ -34,6 +34,9 @@ use crate::signature::{Signature, Signable, LineageId};
 use crate::confidence::ConfidenceSurface;
 use crate::constraint::ConstraintField;
 use crate::context::ContextField;
+use crate::identity::{
+    CausalPosition, ContentFingerprint, NodeQuarantineState, NodeSignature, VoicePrint,
+};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -221,6 +224,31 @@ pub struct IntentNode {
     /// This is recomputed whenever content changes.
     signature: Signature,
 
+    /// BLAKE3-256 fingerprint of canonical content bytes (Spec 5 §3.1).
+    /// Computed at creation. Stored permanently. Violation of
+    /// `BLAKE3(content) == fingerprint` triggers a `DamageObservation`.
+    /// Like a particle's mass — invariant, observer-independent.
+    content_fingerprint: ContentFingerprint,
+
+    /// Voice print of the agent that created this node (Spec 5 §2.1.1).
+    /// Stored as a hint, NOT verified per-read on normal regions. The
+    /// immune system (Spec 6) verifies behavioral consistency against
+    /// the recorded voice print over time.
+    pub creator_voice: Option<VoicePrint>,
+
+    /// Where this node sits in the fabric's causal structure (Spec 5
+    /// §2.1.1): Lamport timestamp + wall-clock instant + namespace.
+    /// Set by the fabric at insertion time.
+    pub causal_position: Option<CausalPosition>,
+
+    /// Optional per-node Ed25519 signature, required for nodes written
+    /// into high-sensitivity regions (Spec 5 §3.3). Verified on first
+    /// read by an agent outside the creating session.
+    pub node_signature: Option<NodeSignature>,
+
+    /// Quarantine state (Spec 5 §5.6). Default `Normal`.
+    pub quarantine: NodeQuarantineState,
+
     /// Stable identity across mutations — assigned once, never changes.
     /// Even when content changes (and signature changes), lineage_id persists.
     /// NOT included in signature computation.
@@ -262,9 +290,19 @@ impl IntentNode {
         let resolution = ResolutionTarget::Unresolved;
 
         let signature = Self::compute_signature(&want, &constraints, &resolution);
+        // Spec 5 §3.1: BLAKE3 fingerprint computed at creation, stored
+        // permanently. Always on, intrinsic — like a particle's mass.
+        let content_fingerprint = Self::compute_content_fingerprint(
+            &want, &constraints, &resolution,
+        );
 
         Self {
             signature,
+            content_fingerprint,
+            creator_voice: None,
+            causal_position: None,
+            node_signature: None,
+            quarantine: NodeQuarantineState::Normal,
             lineage_id: LineageId::new(),
             version: 0,
             want,
@@ -282,6 +320,21 @@ impl IntentNode {
         let mut node = Self::new(want);
         node.confidence = ConfidenceSurface::understood(comprehension);
         node
+    }
+
+    /// Builder: stamp this node with the creating agent's voice print
+    /// (Spec 5 §2.1.1, §3.2). Voice print stored as a hint — never
+    /// re-verified on read for normal regions.
+    pub fn with_creator_voice(mut self, voice: VoicePrint) -> Self {
+        self.creator_voice = Some(voice);
+        self
+    }
+
+    /// Builder: attach a per-node `NodeSignature` (Spec 5 §3.3). The
+    /// fabric requires this for high-sensitivity regions.
+    pub fn with_node_signature(mut self, sig: NodeSignature) -> Self {
+        self.node_signature = Some(sig);
+        self
     }
 
     /// Get the node's signature (computed identity).
@@ -329,7 +382,32 @@ impl IntentNode {
     /// - Want, constraints, and resolution ARE the meaning.
     pub fn recompute_signature(&mut self) {
         self.signature = Self::compute_signature(&self.want, &self.constraints, &self.resolution);
+        // Spec 5 §3.1: content fingerprint must match content for the
+        // lifetime of the node. When content legitimately changes (via
+        // mutate_node), recompute it; otherwise a stored mismatch is a
+        // DamageObservation trigger.
+        self.content_fingerprint = Self::compute_content_fingerprint(
+            &self.want, &self.constraints, &self.resolution,
+        );
         self.version += 1;
+    }
+
+    /// The BLAKE3-256 content fingerprint (Spec 5 §3.1). Travels with
+    /// the node as an intrinsic, observer-verifiable property.
+    pub fn content_fingerprint(&self) -> &ContentFingerprint {
+        &self.content_fingerprint
+    }
+
+    /// Verify that the stored content fingerprint matches the node's
+    /// current canonical content bytes (Spec 5 §3.1).
+    ///
+    /// Per spec: "Violation of this invariant is a `DamageObservation`
+    /// — evidence of actual harm, not just anomaly."
+    pub fn verify_content_fingerprint(&self) -> bool {
+        let bytes = Self::canonical_content_bytes(
+            &self.want, &self.constraints, &self.resolution,
+        );
+        self.content_fingerprint.verify(&bytes)
     }
 
     /// Internal signature computation.
@@ -338,6 +416,30 @@ impl IntentNode {
         constraints: &ConstraintField,
         resolution: &ResolutionTarget,
     ) -> Signature {
+        let content = Self::canonical_content_bytes(want, constraints, resolution);
+        Signature::from_content(&content)
+    }
+
+    /// BLAKE3-256 of canonical content bytes (Spec 5 §3.1). Same input
+    /// as `compute_signature` so a content change updates both.
+    fn compute_content_fingerprint(
+        want: &SemanticShape,
+        constraints: &ConstraintField,
+        resolution: &ResolutionTarget,
+    ) -> ContentFingerprint {
+        let content = Self::canonical_content_bytes(want, constraints, resolution);
+        ContentFingerprint::compute(&content)
+    }
+
+    /// Build the canonical byte representation of the node's identity-
+    /// bearing content (want + constraints + resolution). This is the
+    /// substrate for both `Signature` (cheap internal index) and
+    /// `ContentFingerprint` (BLAKE3-256, Spec 5 §3.1).
+    fn canonical_content_bytes(
+        want: &SemanticShape,
+        constraints: &ConstraintField,
+        resolution: &ResolutionTarget,
+    ) -> Vec<u8> {
         let mut content = Vec::new();
 
         // Want contributes to identity
@@ -364,7 +466,7 @@ impl IntentNode {
         content.extend(b"|resolution:");
         content.extend(resolution.sig_bytes());
 
-        Signature::from_content(&content)
+        content
     }
 
     /// Partial composite activation weight from locally available data.
@@ -652,5 +754,82 @@ mod tests {
         assert_eq!(MetadataValue::Int(42).as_f64(), Some(42.0));
         assert_eq!(MetadataValue::String("hello".into()).as_f64(), None);
         assert_eq!(MetadataValue::Bool(true).as_f64(), None);
+    }
+
+    // ── Spec 5 identity primitives on IntentNode ──
+
+    #[test]
+    fn new_node_has_content_fingerprint() {
+        let node = IntentNode::new("send a message");
+        // BLAKE3 fingerprints are 32 bytes, never all-zeroes for any
+        // realistic content — confirms compute() actually ran.
+        assert_ne!(node.content_fingerprint().as_bytes(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn content_fingerprint_verifies_unmodified_node() {
+        let node = IntentNode::new("send a message");
+        assert!(node.verify_content_fingerprint(),
+            "A freshly-created node must self-verify its content fingerprint.");
+    }
+
+    #[test]
+    fn content_fingerprint_changes_with_content() {
+        let n1 = IntentNode::new("send a message");
+        let n2 = IntentNode::new("send a different message");
+        assert_ne!(n1.content_fingerprint(), n2.content_fingerprint());
+    }
+
+    #[test]
+    fn content_fingerprint_is_recomputed_on_legitimate_mutation() {
+        let mut node = IntentNode::new("buy groceries");
+        let original_fp = *node.content_fingerprint();
+        node.constraints.add_hard("must be cheap");
+        node.recompute_signature();
+        assert_ne!(*node.content_fingerprint(), original_fp,
+            "recompute_signature must also recompute content_fingerprint.");
+        assert!(node.verify_content_fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_mismatch_signals_damage() {
+        // Spec 5 §3.1: "Violation of this invariant is a DamageObservation".
+        // Simulate corruption by mutating content_fingerprint via the
+        // recompute path: take a fingerprint from a different node and
+        // assign it (something only persistence-bug or attacker would do).
+        let mut node = IntentNode::new("the original content");
+        let imposter = IntentNode::new("totally different content");
+        node.content_fingerprint = *imposter.content_fingerprint();
+        assert!(!node.verify_content_fingerprint(),
+            "A stored fingerprint that doesn't match content must surface \
+             as a DamageObservation trigger (Spec 5 §3.1).");
+    }
+
+    #[test]
+    fn creator_voice_default_is_none() {
+        let node = IntentNode::new("test");
+        assert!(node.creator_voice.is_none(),
+            "Plain IntentNode::new has no creator — fabric or builder sets it.");
+    }
+
+    #[test]
+    fn with_creator_voice_stores_voice_print() {
+        use crate::identity::generate_agent_keypair;
+        let agent = generate_agent_keypair();
+        let node = IntentNode::new("test").with_creator_voice(agent.voice_print());
+        assert_eq!(node.creator_voice, Some(agent.voice_print()));
+    }
+
+    #[test]
+    fn quarantine_default_is_normal() {
+        let node = IntentNode::new("test");
+        assert!(matches!(node.quarantine, NodeQuarantineState::Normal));
+    }
+
+    #[test]
+    fn causal_position_default_is_none() {
+        let node = IntentNode::new("test");
+        assert!(node.causal_position.is_none(),
+            "causal_position is set by the fabric at insertion, not by IntentNode::new.");
     }
 }
