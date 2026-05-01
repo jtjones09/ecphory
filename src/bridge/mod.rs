@@ -20,11 +20,13 @@
 // bridge is what Nabu, the immune system (Spec 6), and team-node
 // agents will speak to.
 
+pub mod decay;
 pub mod fabric_trait;
 pub mod bridge_fabric;
 pub mod debug;
 pub mod mechanical;
 pub mod observability;
+pub mod p53;
 pub mod semantic;
 pub mod subscription;
 
@@ -43,3 +45,5 @@ pub use subscription::{
     Callback, CallbackResult, DispatchConfig, ObserverContext, Predicate, SubscribeError,
     SubscriptionId, SubscriptionState,
 };
+pub use decay::{DecayConfig, DecayError, DecayReport};
+pub use p53::{P53Config, P53Key, P53Receipt, P53Scope, SafetyError};

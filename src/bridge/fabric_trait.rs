@@ -14,7 +14,9 @@ use crate::node::IntentNode;
 use crate::signature::LineageId;
 use std::time::Duration;
 
+use super::decay::{DecayError, DecayReport};
 use super::mechanical::EditReceipt;
+use super::p53::{P53Key, P53Receipt, P53Scope, SafetyError};
 use super::semantic::{CheckoutHandle, ConsensusSnapshot, ProposalHandle};
 use super::subscription::{Callback, Predicate, SubscribeError, SubscriptionId, SubscriptionState};
 
@@ -125,4 +127,18 @@ pub trait Fabric: Send + Sync {
     /// observation count, panic count, lagged status. Surfaced via
     /// `/debug/fabric/subscriptions` per Spec 8 §8.5.3.
     fn subscription_state(&self, id: SubscriptionId) -> Option<SubscriptionState>;
+
+    // ── Spec 8 §8.4 — fabric mortality ──
+
+    /// Trigger p53 self-termination at the given scope. The signer
+    /// must match the configured operator key (when one is set).
+    /// `Fabric` scope additionally requires that fabric-scope is
+    /// explicitly enabled in `P53Config` — production should leave
+    /// it disabled and enable only via the operator runbook.
+    fn p53_trigger(&self, scope: P53Scope, signer: &P53Key) -> Result<P53Receipt, SafetyError>;
+
+    /// Run a single decay-tick sweep over the fabric. Returns a
+    /// `DecayReport` describing what was evaluated, what dissolved,
+    /// and whether the tick exceeded its budget.
+    fn decay_tick(&self) -> Result<DecayReport, DecayError>;
 }

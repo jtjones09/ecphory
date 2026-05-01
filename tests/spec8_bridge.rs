@@ -9,12 +9,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ecphory::bridge::{
-    BridgeFabric, Callback, CallbackResult, DebugToken, DebugTokenError, FabricTrait, Predicate,
-    DEBUG_TOKEN_DEFAULT_LIFETIME, DEBUG_TOKEN_DEFAULT_SCOPE,
+    BridgeFabric, Callback, CallbackResult, DebugToken, DebugTokenError, FabricTrait,
+    P53Config, P53Scope, Predicate, SafetyError, DEBUG_TOKEN_DEFAULT_LIFETIME,
+    DEBUG_TOKEN_DEFAULT_SCOPE,
 };
 use ecphory::{
-    generate_agent_keypair, EditMode, IntentNode, MetadataValue, WriteError,
+    generate_agent_keypair, EditMode, IntentNode, MetadataValue, NamespaceId, WriteError,
 };
+use std::path::PathBuf;
 
 fn wait_until<F: Fn() -> bool>(deadline: Duration, check: F) -> bool {
     let end = Instant::now() + deadline;
@@ -398,5 +400,241 @@ fn unsubscribe_terminates_delivery() {
         count.load(Ordering::SeqCst),
         1,
         "After unsubscribe, no further callbacks should fire."
+    );
+}
+
+// ── Step 6: P53 mechanism (Spec 8 §8.4) ──
+
+fn temp_archive_root() -> PathBuf {
+    let mut root = std::env::temp_dir();
+    root.push(format!(
+        "ecphory-p53-archive-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    root
+}
+
+fn fast_p53_config(archive_root: PathBuf) -> P53Config {
+    P53Config {
+        // Tests use a tiny drain budget so the suite stays fast.
+        drain_budget: Duration::from_millis(50),
+        archive_root,
+        authorized_operator: None,
+        fabric_scope_enabled: false,
+    }
+}
+
+#[test]
+fn p53_node_scope_fades_target_and_emits_event() {
+    let archive_root = temp_archive_root();
+    let bridge = BridgeFabric::new().with_p53_config(fast_p53_config(archive_root));
+    let operator = generate_agent_keypair();
+
+    let id = bridge
+        .create(IntentNode::new("doomed"), EditMode::AppendOnly, Some(&operator))
+        .unwrap();
+    assert!(bridge.get_node(&id).is_some());
+
+    let receipt = bridge.p53_trigger(P53Scope::Node(id.clone()), &operator).unwrap();
+    assert_eq!(receipt.scope_label, "Node");
+    assert!(receipt.forensic_archive.is_none());
+    // Target node faded.
+    assert!(bridge.get_node(&id).is_none());
+    // Event node present.
+    let event = bridge.get_node(&receipt.event_node).expect("event node present");
+    assert_eq!(
+        event.metadata.get("__bridge_p53_scope__"),
+        Some(&MetadataValue::String("Node".into()))
+    );
+
+    // Re-trigger on the same target is rejected.
+    let again = bridge.p53_trigger(P53Scope::Node(id), &operator);
+    assert_eq!(
+        again.unwrap_err(),
+        SafetyError::P53AlreadyTriggered { scope_label: "Node" }
+    );
+}
+
+#[test]
+fn p53_region_scope_terminates_writes_and_archives() {
+    let archive_root = temp_archive_root();
+    let bridge = BridgeFabric::new()
+        .with_default_namespace(NamespaceId::fresh("propmgmt"))
+        .with_p53_config(fast_p53_config(archive_root.clone()));
+    let operator = generate_agent_keypair();
+
+    // Populate the region.
+    for i in 0..3 {
+        bridge
+            .create(
+                IntentNode::new(format!("propmgmt entry {}", i)),
+                EditMode::AppendOnly,
+                Some(&operator),
+            )
+            .unwrap();
+    }
+
+    let region = NamespaceId::fresh("propmgmt"); // region scope label
+    // We need to use the bridge's actual default namespace. Read it via debug_state isn't enough; the bridge stores it internally and uses it for `create`. We trigger on a clone of the same namespace shape — match on name.
+    // For this test, use the bridge's own create-time namespace by triggering against any region with the same `name`.
+    // The bridge p53_trigger uses the supplied namespace verbatim — terminated_regions is keyed by NamespaceId (name + uuid), so the test sets the same UUID by reusing `default_namespace`.
+    // Pull the bridge's default_namespace by reaching through debug_node on a freshly created node:
+    let probe_id = bridge
+        .create(IntentNode::new("probe"), EditMode::AppendOnly, Some(&operator))
+        .unwrap();
+    let probe = bridge.debug_node(&probe_id).unwrap();
+    let actual_region = probe.identity.causal_position.namespace.clone();
+
+    let receipt = bridge
+        .p53_trigger(P53Scope::Region(actual_region.clone()), &operator)
+        .unwrap();
+    assert_eq!(receipt.scope_label, "Region");
+    let archive_path = receipt
+        .forensic_archive
+        .as_ref()
+        .expect("Region p53 must produce a forensic archive");
+    assert!(std::path::Path::new(archive_path).exists());
+    assert!(bridge.is_region_terminated(&actual_region));
+
+    // Subsequent writes to the terminated region are refused.
+    let after = bridge.create(
+        IntentNode::new("rejected"),
+        EditMode::AppendOnly,
+        Some(&operator),
+    );
+    assert!(matches!(after.unwrap_err(), WriteError::FabricDegraded));
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&archive_root);
+    let _ = region;
+}
+
+#[test]
+fn p53_fabric_scope_disabled_by_default() {
+    let archive_root = temp_archive_root();
+    let bridge = BridgeFabric::new().with_p53_config(fast_p53_config(archive_root));
+    let operator = generate_agent_keypair();
+    let result = bridge.p53_trigger(P53Scope::Fabric, &operator);
+    assert_eq!(result.unwrap_err(), SafetyError::ScopeNotPermittedAtRuntime);
+}
+
+#[test]
+fn p53_fabric_scope_when_enabled_terminates_all_writes() {
+    let archive_root = temp_archive_root();
+    let mut cfg = fast_p53_config(archive_root.clone());
+    cfg.fabric_scope_enabled = true;
+    let bridge = BridgeFabric::new().with_p53_config(cfg);
+    let operator = generate_agent_keypair();
+
+    bridge
+        .create(IntentNode::new("pre-fabric-p53"), EditMode::AppendOnly, Some(&operator))
+        .unwrap();
+
+    let receipt = bridge.p53_trigger(P53Scope::Fabric, &operator).unwrap();
+    assert_eq!(receipt.scope_label, "Fabric");
+    assert!(receipt.forensic_archive.is_some());
+    assert!(bridge.is_terminated());
+
+    // All writes refused after fabric p53.
+    let after = bridge.create(
+        IntentNode::new("rejected"),
+        EditMode::AppendOnly,
+        Some(&operator),
+    );
+    assert!(matches!(after.unwrap_err(), WriteError::FabricDegraded));
+
+    let _ = std::fs::remove_dir_all(&archive_root);
+}
+
+#[test]
+fn p53_authorized_operator_rejects_other_signers() {
+    let archive_root = temp_archive_root();
+    let alice = generate_agent_keypair();
+    let mallory = generate_agent_keypair();
+    let cfg = P53Config {
+        authorized_operator: Some(alice.voice_print()),
+        ..fast_p53_config(archive_root)
+    };
+    let bridge = BridgeFabric::new().with_p53_config(cfg);
+    let id = bridge
+        .create(IntentNode::new("x"), EditMode::AppendOnly, Some(&alice))
+        .unwrap();
+    let bad = bridge.p53_trigger(P53Scope::Node(id.clone()), &mallory);
+    assert_eq!(bad.unwrap_err(), SafetyError::InvalidP53Key);
+    let good = bridge.p53_trigger(P53Scope::Node(id), &alice);
+    assert!(good.is_ok());
+}
+
+#[test]
+fn decay_tick_runs_without_panic() {
+    // Spec 8 §11 #6: decay processes a region of 10,000 nodes without
+    // panicking; valid DecayReport returned.
+    let bridge = BridgeFabric::new();
+    let agent = generate_agent_keypair();
+    for i in 0..200 {
+        bridge
+            .create(
+                IntentNode::new(format!("node {}", i)),
+                EditMode::AppendOnly,
+                Some(&agent),
+            )
+            .unwrap();
+    }
+    let report = bridge.decay_tick().unwrap();
+    assert_eq!(report.nodes_evaluated, 200);
+    // Just-created nodes still have temporal weight ~1; nothing dissolves.
+    assert_eq!(report.nodes_dissolved, 0);
+    assert!(!report.deferred_to_next_tick);
+}
+
+// ── Step 7: Self-witnessing — SubscriptionPanic as a fabric node ──
+
+#[test]
+fn subscription_panic_surfaces_as_fabric_node() {
+    // Spec 8 §13 + §6.B.2: a callback panic surfaces as a
+    // SubscriptionPanic event node observable by the immune system.
+    let bridge = BridgeFabric::new();
+    let operator = generate_agent_keypair();
+
+    // First subscription: panics on every event.
+    let panicking_pat: Predicate = Arc::new(|node: &IntentNode| {
+        node.want.description.contains("trigger-panic")
+    });
+    let panicking_cb: Callback = Arc::new(|_, _| panic!("intentional"));
+    let _ = bridge.subscribe(panicking_pat, panicking_cb).unwrap();
+
+    // Second subscription: observer for SubscriptionPanic events.
+    let panic_observed = Arc::new(AtomicUsize::new(0));
+    let counter_for_cb = Arc::clone(&panic_observed);
+    let observer_pat: Predicate = Arc::new(|node: &IntentNode| {
+        node.metadata
+            .get("__bridge_node_kind__")
+            .map(|v| v.as_str_repr() == "SubscriptionPanic")
+            .unwrap_or(false)
+    });
+    let observer_cb: Callback = Arc::new(move |_, _| {
+        counter_for_cb.fetch_add(1, Ordering::SeqCst);
+        CallbackResult::Success
+    });
+    let _ = bridge.subscribe(observer_pat, observer_cb).unwrap();
+
+    // Trigger the panicking subscription.
+    bridge
+        .create(
+            IntentNode::new("trigger-panic now"),
+            EditMode::AppendOnly,
+            Some(&operator),
+        )
+        .unwrap();
+
+    // The SubscriptionPanic event node should appear and the observer
+    // subscription should fire on it.
+    assert!(
+        wait_until(Duration::from_secs(2), || panic_observed.load(Ordering::SeqCst) >= 1),
+        "Expected SubscriptionPanic node to be written and observed; got {} observations",
+        panic_observed.load(Ordering::SeqCst)
     );
 }

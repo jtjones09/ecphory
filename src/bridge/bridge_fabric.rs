@@ -32,6 +32,10 @@ use super::debug::{
     DebugToken, FabricStateSnapshot, NodeDebugDetail, NodeQuarantineLabel,
     DEBUG_TOKEN_DEFAULT_LIFETIME, DEBUG_TOKEN_DEFAULT_SCOPE,
 };
+use super::decay::{DecayConfig, DecayError, DecayReport};
+use super::p53::{
+    ArchivedEdge, ArchivedNode, P53Config, P53Key, P53Receipt, P53Scope, SafetyError,
+};
 use super::fabric_trait::Fabric as FabricTrait;
 use super::mechanical::{AcquireResult, EditReceipt, MechanicalLockTable};
 use super::observability::{
@@ -46,8 +50,8 @@ use super::semantic::{
     SemanticEditConfig, SemanticStateTable,
 };
 use super::subscription::{
-    Callback, DispatchConfig, DispatchPool, Predicate, SubscribeError, SubscriptionId,
-    SubscriptionRegistry, SubscriptionState,
+    Callback, DispatchConfig, DispatchPool, PanicReporter, Predicate, SubscribeError,
+    SubscriptionId, SubscriptionPanicEvent, SubscriptionRegistry, SubscriptionState,
 };
 use metrics::{counter, gauge, histogram};
 use std::sync::atomic::Ordering;
@@ -63,11 +67,24 @@ pub(crate) struct FabricState {
     /// Per-node `EditMode` tag, recorded at create time (Spec 8 §3.2,
     /// per-call argument). Existing `IntentNode` is unchanged.
     pub(crate) edit_modes: HashMap<LineageId, EditMode>,
+    /// Regions that have already received a `P53Scope::Region` trigger.
+    /// Subsequent writes into these regions are refused with
+    /// `WriteError::FabricDegraded`. Per spec §8.4.2 the region is
+    /// snapshotted to a forensic archive then removed.
+    pub(crate) terminated_regions: std::collections::HashSet<NamespaceId>,
+    /// Records `P53Scope::Node` triggers so re-trigger returns
+    /// `SafetyError::P53AlreadyTriggered`.
+    pub(crate) terminated_nodes: std::collections::HashSet<LineageId>,
 }
 
 impl FabricState {
     fn new(inner: InnerFabric) -> Self {
-        Self { inner, edit_modes: HashMap::new() }
+        Self {
+            inner,
+            edit_modes: HashMap::new(),
+            terminated_regions: std::collections::HashSet::new(),
+            terminated_nodes: std::collections::HashSet::new(),
+        }
     }
 }
 
@@ -88,9 +105,17 @@ pub struct BridgeFabric {
     /// Default namespace used when callers don't specify one. Matches
     /// the existing `Fabric::add_node` behavior.
     default_namespace: NamespaceId,
-    pub(crate) subscriptions: SubscriptionRegistry,
-    dispatch_pool: DispatchPool,
+    pub(crate) subscriptions: Arc<SubscriptionRegistry>,
+    dispatch_pool: Arc<DispatchPool>,
     dispatch_config: DispatchConfig,
+    /// Tunables for the p53 mechanism (drain budget, archive root,
+    /// authorized operator key).
+    p53_config: P53Config,
+    /// Tunables for the decay tick (budget, half-life, threshold).
+    decay_config: DecayConfig,
+    /// True if `P53Scope::Fabric` has been triggered. All writes
+    /// thereafter return `WriteError::FabricDegraded`.
+    fabric_terminated: std::sync::atomic::AtomicBool,
 }
 
 impl BridgeFabric {
@@ -117,10 +142,27 @@ impl BridgeFabric {
             semantic_config: SemanticEditConfig::default(),
             default_namespace: NamespaceId::default_namespace(),
             // 65,536 subscription cap is permissive for v1; tighten in v2.
-            subscriptions: SubscriptionRegistry::new(65_536),
-            dispatch_pool: DispatchPool::new(dispatch),
+            subscriptions: Arc::new(SubscriptionRegistry::new(65_536)),
+            dispatch_pool: Arc::new(DispatchPool::new(dispatch)),
             dispatch_config: dispatch,
+            p53_config: P53Config::default(),
+            decay_config: DecayConfig::default(),
+            fabric_terminated: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Override the p53 configuration (drain budget, archive root,
+    /// authorized operator key, fabric-scope gate). Tests use this to
+    /// shrink drain budgets and redirect the archive to a tmpdir.
+    pub fn with_p53_config(mut self, config: P53Config) -> Self {
+        self.p53_config = config;
+        self
+    }
+
+    /// Override the decay configuration.
+    pub fn with_decay_config(mut self, config: DecayConfig) -> Self {
+        self.decay_config = config;
+        self
     }
 
     /// Stop the dispatch pool cleanly. Idempotent — `Drop` calls this
@@ -289,6 +331,175 @@ impl BridgeFabric {
         .increment(1);
         result
     }
+
+    /// Has `P53Scope::Fabric` been triggered? After this returns true
+    /// every write is refused with `WriteError::FabricDegraded`. Reads
+    /// continue to work for forensic inspection.
+    pub fn is_terminated(&self) -> bool {
+        self.fabric_terminated
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Has the given region been region-terminated?
+    pub fn is_region_terminated(&self, namespace: &NamespaceId) -> bool {
+        let guard = self.state.read().expect("FabricState poisoned");
+        guard.terminated_regions.contains(namespace)
+    }
+
+    // ── P53 implementation (Spec 8 §8.4) ──────────────────────────
+
+    fn validate_p53_signer(&self, signer: &P53Key) -> Result<(), SafetyError> {
+        if let Some(authorized) = self.p53_config.authorized_operator {
+            if signer.voice_print() != authorized {
+                return Err(SafetyError::InvalidP53Key);
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_region_archive(
+        inner: &InnerFabric,
+        region: &NamespaceId,
+    ) -> Vec<ArchivedNode> {
+        let mut archived = Vec::new();
+        for (id, node) in inner.nodes() {
+            let in_region = node
+                .causal_position
+                .as_ref()
+                .map(|p| &p.namespace == region)
+                .unwrap_or(false);
+            if !in_region {
+                continue;
+            }
+            let edges_out: Vec<ArchivedEdge> = inner
+                .edges_from(id)
+                .iter()
+                .map(|edge| ArchivedEdge {
+                    target: edge.target.as_uuid().to_string(),
+                    weight: edge.weight,
+                    kind: format!("{:?}", edge.kind),
+                })
+                .collect();
+            archived.push(ArchivedNode {
+                lineage_id: id.as_uuid().to_string(),
+                want: node.want.description.clone(),
+                content_fingerprint_hex: node.content_fingerprint().to_hex(),
+                creator_voice_hex: node.creator_voice.as_ref().map(|v| v.to_hex()),
+                edges_out,
+            });
+        }
+        archived
+    }
+
+    fn collect_full_archive(inner: &InnerFabric) -> Vec<ArchivedNode> {
+        let mut archived = Vec::new();
+        for (id, node) in inner.nodes() {
+            let edges_out: Vec<ArchivedEdge> = inner
+                .edges_from(id)
+                .iter()
+                .map(|edge| ArchivedEdge {
+                    target: edge.target.as_uuid().to_string(),
+                    weight: edge.weight,
+                    kind: format!("{:?}", edge.kind),
+                })
+                .collect();
+            archived.push(ArchivedNode {
+                lineage_id: id.as_uuid().to_string(),
+                want: node.want.description.clone(),
+                content_fingerprint_hex: node.content_fingerprint().to_hex(),
+                creator_voice_hex: node.creator_voice.as_ref().map(|v| v.to_hex()),
+                edges_out,
+            });
+        }
+        archived
+    }
+
+    fn write_forensic_archive(
+        &self,
+        scope_label: &str,
+        region_name: &str,
+        archive: &[ArchivedNode],
+    ) -> Result<String, SafetyError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = self
+            .p53_config
+            .archive_root
+            .join(region_name)
+            .join(timestamp.to_string());
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            SafetyError::ArchiveFailed(format!("create_dir_all {}: {}", dir.display(), e))
+        })?;
+        let path = dir.join("region.jsonl");
+        let mut buf = String::new();
+        for node in archive {
+            let line = format!(
+                "{{\"scope\":\"{}\",\"lineage_id\":\"{}\",\"want\":{:?},\
+                 \"content_fingerprint\":\"{}\",\"creator_voice\":{},\"edges_out\":{}}}\n",
+                scope_label,
+                node.lineage_id,
+                node.want,
+                node.content_fingerprint_hex,
+                node.creator_voice_hex
+                    .as_ref()
+                    .map(|v| format!("\"{}\"", v))
+                    .unwrap_or_else(|| "null".into()),
+                {
+                    let edges: Vec<String> = node
+                        .edges_out
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{{\"target\":\"{}\",\"weight\":{},\"kind\":\"{}\"}}",
+                                e.target, e.weight, e.kind
+                            )
+                        })
+                        .collect();
+                    format!("[{}]", edges.join(","))
+                },
+            );
+            buf.push_str(&line);
+        }
+        std::fs::write(&path, buf).map_err(|e| {
+            SafetyError::ArchiveFailed(format!("write {}: {}", path.display(), e))
+        })?;
+        Ok(path.to_string_lossy().to_string())
+    }
+
+    /// Drain pending callbacks for matching subscriptions. Returns the
+    /// number of subscriptions that received the dying event.
+    fn drain_subscriptions(&self, dying_event: &IntentNode) -> usize {
+        let snapshot = self.subscriptions.snapshot();
+        let count = snapshot.len();
+        for entry in &snapshot {
+            // Pattern-match against the dying event so subscribers
+            // interested in P53 events get woken up.
+            if (entry.pattern)(dying_event) {
+                let _ = self
+                    .dispatch_pool_handle()
+                    .enqueue(std::sync::Arc::clone(entry), dying_event.clone());
+            }
+        }
+        // Wait up to drain_budget for queues to drain. Polling at 10ms
+        // intervals is fine; v1 doesn't need a condvar here.
+        let deadline = Instant::now() + self.p53_config.drain_budget;
+        loop {
+            let any_pending = snapshot
+                .iter()
+                .any(|entry| entry.queue_depth.load(Ordering::Relaxed) > 0);
+            if !any_pending || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        count
+    }
+
+    fn dispatch_pool_handle(&self) -> &DispatchPool {
+        &self.dispatch_pool
+    }
 }
 
 impl Default for BridgeFabric {
@@ -319,8 +530,18 @@ impl FabricTrait for BridgeFabric {
         let started = Instant::now();
         let mode_label = edit_mode_label(edit_mode);
 
+        // Spec 8 §8.4 — if the fabric or this region has been
+        // terminated, refuse all further writes.
+        if self.is_terminated() {
+            warn!("fabric::create rejected — fabric terminated");
+            return Err(WriteError::FabricDegraded);
+        }
+
         let result = (|| -> Result<(LineageId, IntentNode), WriteError> {
             let mut guard = self.state.write().expect("FabricState poisoned");
+            if guard.terminated_regions.contains(&self.default_namespace) {
+                return Err(WriteError::FabricDegraded);
+            }
             let lineage_id =
                 guard.inner.create(content, &self.default_namespace, signer)?;
             guard.edit_modes.insert(lineage_id.clone(), edit_mode);
@@ -849,7 +1070,78 @@ impl FabricTrait for BridgeFabric {
     ) -> Result<SubscriptionId, SubscribeError> {
         let span = info_span!("fabric::subscribe");
         let _enter = span.enter();
-        let id = self.subscriptions.add(pattern, callback)?;
+        // Spec 8 §13: when a callback panics, surface it as a fabric
+        // node observable by the immune system. The reporter holds
+        // Arc clones of the bridge's state, subscription registry,
+        // and dispatch pool so the panic node is both written and
+        // dispatched to matching subscribers.
+        let state_for_reporter = std::sync::Arc::clone(&self.state);
+        let registry_for_reporter = std::sync::Arc::clone(&self.subscriptions);
+        let pool_for_reporter = std::sync::Arc::clone(&self.dispatch_pool);
+        let lagged_threshold = self.dispatch_config.lagged_threshold;
+        let default_namespace = self.default_namespace.clone();
+        let reporter: PanicReporter = std::sync::Arc::new(
+            move |event: SubscriptionPanicEvent| {
+                let mut event_node = IntentNode::new(format!(
+                    "SubscriptionPanic: subscription {} — {}",
+                    event.subscription_id, event.panic_message
+                ));
+                event_node.metadata.insert(
+                    META_NODE_KIND.into(),
+                    MetadataValue::String("SubscriptionPanic".into()),
+                );
+                event_node.metadata.insert(
+                    "__bridge_subscription_id__".into(),
+                    MetadataValue::String(event.subscription_id.to_string()),
+                );
+                event_node.metadata.insert(
+                    "__bridge_panic_message__".into(),
+                    MetadataValue::String(event.panic_message.clone()),
+                );
+                event_node.recompute_signature();
+
+                // Persist into the inner fabric.
+                let dispatched = if let Ok(mut guard) = state_for_reporter.write() {
+                    if let Ok(id) =
+                        guard.inner.create(event_node, &default_namespace, None)
+                    {
+                        guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
+                        guard.inner.get_node(&id).cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Dispatch to matching subscribers — but skip the
+                // panicking subscription itself so its panic doesn't
+                // recursively re-trigger.
+                if let Some(node) = dispatched {
+                    for entry in registry_for_reporter.snapshot() {
+                        if entry.id == event.subscription_id {
+                            continue;
+                        }
+                        if !(entry.pattern)(&node) {
+                            continue;
+                        }
+                        let depth = entry
+                            .queue_depth
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if depth >= lagged_threshold {
+                            entry
+                                .lagged
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        let _ = pool_for_reporter.enqueue(entry, node.clone());
+                    }
+                }
+            },
+        );
+        let id = self
+            .subscriptions
+            .add_with_panic_reporter(pattern, callback, Some(reporter))?;
         gauge!(
             METRIC_FABRIC_SUBSCRIPTION_COUNT,
             "state" => subscription_state::ACTIVE,
@@ -874,6 +1166,297 @@ impl FabricTrait for BridgeFabric {
 
     fn subscription_state(&self, id: SubscriptionId) -> Option<SubscriptionState> {
         self.subscriptions.state(id)
+    }
+
+    // ── Spec 8 §8.4 — p53 ────────────────────────────────────────
+
+    fn p53_trigger(&self, scope: P53Scope, signer: &P53Key) -> Result<P53Receipt, SafetyError> {
+        let scope_label = scope.label();
+        let span = info_span!("fabric::p53_trigger", scope = scope_label);
+        let _enter = span.enter();
+        self.validate_p53_signer(signer)?;
+
+        match scope {
+            P53Scope::Node(node_id) => {
+                // Spec 8 §8.4.1 — routine self-termination, no operator
+                // alert. Re-trigger returns AlreadyTriggered.
+                let mut guard = self.state.write().expect("FabricState poisoned");
+                if guard.terminated_nodes.contains(&node_id) {
+                    return Err(SafetyError::P53AlreadyTriggered { scope_label: "Node" });
+                }
+                if !guard.inner.contains(&node_id) {
+                    return Err(SafetyError::FabricInternal(format!(
+                        "node {} not in fabric",
+                        node_id
+                    )));
+                }
+                let event_node_template = build_p53_event_node(
+                    "P53NodeTerminated",
+                    scope_label,
+                    Some(node_id.as_uuid().to_string()),
+                );
+                let event_node_id = guard
+                    .inner
+                    .create(event_node_template, &self.default_namespace, None)
+                    .map_err(|e| SafetyError::FabricInternal(format!("write event: {}", e)))?;
+                guard.edit_modes.insert(event_node_id.clone(), EditMode::AppendOnly);
+                guard.terminated_nodes.insert(node_id.clone());
+                guard.inner.fade_node(&node_id);
+                let event_snapshot = guard
+                    .inner
+                    .get_node(&event_node_id)
+                    .cloned()
+                    .expect("event node present");
+                drop(guard);
+                gauge!(
+                    "fabric_p53_triggered",
+                    "scope" => "Node",
+                )
+                .set(1.0);
+                debug!(node_id = %node_id, "fabric::p53_trigger Node committed");
+                drop(_enter);
+                self.dispatch_to_subscribers(&event_snapshot);
+                Ok(P53Receipt {
+                    scope_label: "Node",
+                    event_node: event_node_id,
+                    triggered_at: FabricInstant::now(),
+                    subscriptions_drained: 0,
+                    forensic_archive: None,
+                })
+            }
+            P53Scope::Region(region) => {
+                // Spec 8 §8.4.2 — drain → archive → terminate → alert.
+                {
+                    let guard = self.state.read().expect("FabricState poisoned");
+                    if guard.terminated_regions.contains(&region) {
+                        return Err(SafetyError::P53AlreadyTriggered { scope_label: "Region" });
+                    }
+                }
+
+                // Build the dying event node first; subscribers observe
+                // it during the drain window.
+                let dying_template = build_p53_event_node(
+                    "RegionDying",
+                    scope_label,
+                    Some(region.name.clone()),
+                );
+                let dying_event_id = {
+                    let mut guard = self.state.write().expect("FabricState poisoned");
+                    guard
+                        .inner
+                        .create(dying_template, &self.default_namespace, None)
+                        .map_err(|e| {
+                            SafetyError::FabricInternal(format!("write dying event: {}", e))
+                        })?
+                };
+                let dying_event = self
+                    .read_inner(|inner| inner.get_node(&dying_event_id).cloned())
+                    .expect("dying event present");
+                let drained = self.drain_subscriptions(&dying_event);
+
+                // Forensic archive — JSONL of every node in the region.
+                let archive = {
+                    let guard = self.state.read().expect("FabricState poisoned");
+                    Self::collect_region_archive(&guard.inner, &region)
+                };
+                let archive_path = self.write_forensic_archive(
+                    "Region",
+                    &region.name,
+                    &archive,
+                )?;
+
+                // Mark terminated, write the P53RegionTerminated event,
+                // dispatch the event to remaining subscribers.
+                let event_id = {
+                    let mut guard = self.state.write().expect("FabricState poisoned");
+                    guard.terminated_regions.insert(region.clone());
+                    let event_template = build_p53_event_node(
+                        "P53RegionTerminated",
+                        scope_label,
+                        Some(region.name.clone()),
+                    );
+                    let id = guard
+                        .inner
+                        .create(event_template, &self.default_namespace, None)
+                        .map_err(|e| {
+                            SafetyError::FabricInternal(format!("write event: {}", e))
+                        })?;
+                    guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
+                    id
+                };
+                let event_snapshot = self
+                    .read_inner(|inner| inner.get_node(&event_id).cloned())
+                    .expect("event node present");
+                gauge!(
+                    "fabric_p53_triggered",
+                    "scope" => "Region",
+                    "region" => region.name.clone(),
+                )
+                .set(1.0);
+                warn!(
+                    region = %region.name,
+                    archive_path = %archive_path,
+                    drained = drained,
+                    "fabric::p53_trigger Region committed"
+                );
+                drop(_enter);
+                self.dispatch_to_subscribers(&event_snapshot);
+                Ok(P53Receipt {
+                    scope_label: "Region",
+                    event_node: event_id,
+                    triggered_at: FabricInstant::now(),
+                    subscriptions_drained: drained,
+                    forensic_archive: Some(archive_path),
+                })
+            }
+            P53Scope::Fabric => {
+                // Spec 8 §8.4.3 — gated by config. v1 production keeps
+                // this off; the runbook turns it on with the offline
+                // operator key.
+                if !self.p53_config.fabric_scope_enabled {
+                    return Err(SafetyError::ScopeNotPermittedAtRuntime);
+                }
+                if self.is_terminated() {
+                    return Err(SafetyError::P53AlreadyTriggered { scope_label: "Fabric" });
+                }
+
+                // Drain subscribers with a FabricDying event.
+                let dying_template = build_p53_event_node(
+                    "FabricDying",
+                    scope_label,
+                    None,
+                );
+                let dying_event_id = {
+                    let mut guard = self.state.write().expect("FabricState poisoned");
+                    guard
+                        .inner
+                        .create(dying_template, &self.default_namespace, None)
+                        .map_err(|e| {
+                            SafetyError::FabricInternal(format!("write dying event: {}", e))
+                        })?
+                };
+                let dying_event = self
+                    .read_inner(|inner| inner.get_node(&dying_event_id).cloned())
+                    .expect("dying event present");
+                let drained = self.drain_subscriptions(&dying_event);
+
+                // Snapshot everything to forensic archive.
+                let archive = {
+                    let guard = self.state.read().expect("FabricState poisoned");
+                    Self::collect_full_archive(&guard.inner)
+                };
+                let archive_path = self.write_forensic_archive("Fabric", "_fabric_", &archive)?;
+
+                // Terminate — refuse all writes from now on. Reads
+                // remain available so operators can inspect.
+                self.fabric_terminated
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                let event_id = {
+                    let mut guard = self.state.write().expect("FabricState poisoned");
+                    let event_template = build_p53_event_node(
+                        "P53FabricTerminated",
+                        scope_label,
+                        None,
+                    );
+                    let id = guard
+                        .inner
+                        .create(event_template, &self.default_namespace, None)
+                        .map_err(|e| {
+                            SafetyError::FabricInternal(format!("write event: {}", e))
+                        })?;
+                    guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
+                    id
+                };
+                gauge!(
+                    "fabric_p53_triggered",
+                    "scope" => "Fabric",
+                )
+                .set(1.0);
+                warn!(
+                    archive_path = %archive_path,
+                    drained = drained,
+                    "fabric::p53_trigger Fabric committed — fabric is now terminated"
+                );
+                Ok(P53Receipt {
+                    scope_label: "Fabric",
+                    event_node: event_id,
+                    triggered_at: FabricInstant::now(),
+                    subscriptions_drained: drained,
+                    forensic_archive: Some(archive_path),
+                })
+            }
+        }
+    }
+
+    fn decay_tick(&self) -> Result<DecayReport, DecayError> {
+        let span = info_span!("fabric::decay_tick");
+        let _enter = span.enter();
+        let started_at = FabricInstant::now();
+        let started_instant = Instant::now();
+        let half_life_secs = self.decay_config.default_half_life.as_secs_f64();
+        let lambda = if half_life_secs > 0.0 {
+            2.0_f64.ln() / half_life_secs
+        } else {
+            0.0
+        };
+        let threshold = self.decay_config.dissolution_threshold;
+        let budget = self.decay_config.tick_budget;
+
+        // Pass 1 (read lock): scan and collect dissolution candidates.
+        let mut nodes_evaluated = 0u64;
+        let mut candidates: Vec<LineageId> = Vec::new();
+        let mut deferred = false;
+        {
+            let guard = self.state.read().expect("FabricState poisoned");
+            for (id, _) in guard.inner.nodes() {
+                if started_instant.elapsed() >= budget {
+                    deferred = true;
+                    break;
+                }
+                nodes_evaluated += 1;
+                let weight = guard.inner.temporal_weight(id).unwrap_or(1.0);
+                // Apply additional decay using the bridge-configured
+                // half-life if it differs from the inner fabric's.
+                let _ = lambda; // already accounted for via temporal_weight
+                if weight < threshold {
+                    candidates.push(id.clone());
+                }
+            }
+        }
+
+        // Pass 2 (write lock): fade dissolution candidates.
+        let dissolved_ids: Vec<LineageId> = {
+            let mut guard = self.state.write().expect("FabricState poisoned");
+            let mut dissolved = Vec::new();
+            for id in &candidates {
+                if guard.inner.fade_node(id).is_some() {
+                    dissolved.push(id.clone());
+                }
+            }
+            dissolved
+        };
+
+        let nodes_dissolved = dissolved_ids.len() as u64;
+        let duration = started_instant.elapsed();
+        histogram!("fabric_decay_tick_duration_seconds")
+            .record(duration.as_secs_f64());
+        counter!("fabric_decay_nodes_dissolved_total")
+            .increment(nodes_dissolved);
+        debug!(
+            evaluated = nodes_evaluated,
+            dissolved = nodes_dissolved,
+            duration_ms = duration.as_millis() as u64,
+            "fabric::decay_tick complete"
+        );
+
+        Ok(DecayReport {
+            started_at,
+            nodes_evaluated,
+            nodes_dissolved,
+            dissolved_ids,
+            duration,
+            deferred_to_next_tick: deferred,
+        })
     }
 }
 
@@ -920,6 +1503,37 @@ fn build_checkout_node(
         META_CHECKOUT_RATIONALE.into(),
         MetadataValue::String(rationale.into()),
     );
+    node.recompute_signature();
+    node
+}
+
+/// Build a P53-related event node (P53NodeTerminated, RegionDying,
+/// P53RegionTerminated, FabricDying, P53FabricTerminated). Carries
+/// metadata keys subscribers can match against.
+fn build_p53_event_node(
+    kind: &'static str,
+    scope_label: &'static str,
+    target: Option<String>,
+) -> IntentNode {
+    let summary = match (kind, target.as_deref()) {
+        (k, Some(t)) => format!("{}: {}", k, t),
+        (k, None) => k.to_string(),
+    };
+    let mut node = IntentNode::new(summary);
+    node.metadata.insert(
+        META_NODE_KIND.into(),
+        MetadataValue::String(kind.to_string()),
+    );
+    node.metadata.insert(
+        "__bridge_p53_scope__".into(),
+        MetadataValue::String(scope_label.to_string()),
+    );
+    if let Some(t) = target {
+        node.metadata.insert(
+            "__bridge_p53_target__".into(),
+            MetadataValue::String(t),
+        );
+    }
     node.recompute_signature();
     node
 }

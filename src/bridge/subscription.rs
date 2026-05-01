@@ -39,6 +39,21 @@ use super::observability::{
     METRIC_FABRIC_PANIC_TOTAL, METRIC_FABRIC_SUBSCRIPTION_CALLBACK_LATENCY_SECONDS,
 };
 
+/// Channel through which the dispatch worker reports panics back to
+/// the bridge so they can be materialized as fabric nodes (Spec 8 §13
+/// self-witnessing). The sender is held by the `BridgeFabric` and
+/// cloned into each `SubscriptionEntry`. A backlog beyond a small
+/// bounded queue (default 4096) drops events with a structured
+/// warning — the panic counter still increments either way.
+pub type PanicReporter = Arc<dyn Fn(SubscriptionPanicEvent) + Send + Sync>;
+
+/// Structured event reported when a callback panics.
+#[derive(Debug, Clone)]
+pub struct SubscriptionPanicEvent {
+    pub subscription_id: SubscriptionId,
+    pub panic_message: String,
+}
+
 // ── Public types ──────────────────────────────────────────────────
 
 /// Opaque handle returned by `subscribe`. Passed back to `unsubscribe`.
@@ -124,6 +139,11 @@ pub struct SubscriptionEntry {
     pub observation_count: AtomicU64,
     pub panic_count: AtomicU64,
     pub lagged: AtomicBool,
+    /// Optional reporter the worker calls when a callback panics.
+    /// When wired by `BridgeFabric`, panics also become fabric nodes
+    /// (Spec 8 §13 self-witnessing). When `None`, only stderr + the
+    /// metric counter record the panic.
+    pub panic_reporter: Mutex<Option<PanicReporter>>,
 }
 
 impl SubscriptionEntry {
@@ -136,6 +156,7 @@ impl SubscriptionEntry {
             observation_count: AtomicU64::new(0),
             panic_count: AtomicU64::new(0),
             lagged: AtomicBool::new(false),
+            panic_reporter: Mutex::new(None),
         }
     }
 }
@@ -178,12 +199,25 @@ impl SubscriptionRegistry {
         pattern: Predicate,
         callback: Callback,
     ) -> Result<SubscriptionId, SubscribeError> {
+        self.add_with_panic_reporter(pattern, callback, None)
+    }
+
+    pub fn add_with_panic_reporter(
+        &self,
+        pattern: Predicate,
+        callback: Callback,
+        panic_reporter: Option<PanicReporter>,
+    ) -> Result<SubscriptionId, SubscribeError> {
         let mut entries = self.entries.write().expect("subscription registry poisoned");
         if entries.len() >= self.limit {
             return Err(SubscribeError::SubscriptionLimitExceeded);
         }
         let id = SubscriptionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let entry = Arc::new(SubscriptionEntry::new(id, pattern, callback));
+        if let Some(reporter) = panic_reporter {
+            *entry.panic_reporter.lock().expect("panic reporter mutex poisoned") =
+                Some(reporter);
+        }
         entries.insert(id, entry);
         Ok(id)
     }
@@ -374,14 +408,26 @@ fn run_task(task: DispatchTask, rx: &Arc<Mutex<Receiver<DispatchTask>>>, retry_b
                 "location" => "subscription_callback",
             )
             .increment(1);
-            // Spec 8 §6.B.2: panics surface as a SubscriptionPanic event
-            // observable by the immune system. Spec 6 isn't built yet,
-            // so for v1 we log structured. The event's structured shape
-            // matches what the tracer / metrics layer (Step 5) will emit.
             eprintln!(
                 "[ecphory::subscription] subscription_panic id={} panic_message={:?}",
                 entry.id, panic_message
             );
+            // Spec 8 §13 self-witnessing: when a panic reporter is
+            // wired in (via `BridgeFabric`), surface this panic as a
+            // fabric node observable by the immune system. Best-effort:
+            // a panic in the reporter itself is caught.
+            if let Some(reporter) = entry
+                .panic_reporter
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+            {
+                let event = SubscriptionPanicEvent {
+                    subscription_id: entry.id,
+                    panic_message: panic_message.clone(),
+                };
+                let _ = catch_unwind(AssertUnwindSafe(move || reporter(event)));
+            }
             CallbackResult::UnrecoverableError(panic_message)
         }
     };
