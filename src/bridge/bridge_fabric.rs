@@ -28,8 +28,18 @@ use crate::node::IntentNode;
 use crate::signature::LineageId;
 use crate::temporal::FabricInstant;
 
+use super::debug::{
+    DebugToken, FabricStateSnapshot, NodeDebugDetail, NodeQuarantineLabel,
+    DEBUG_TOKEN_DEFAULT_LIFETIME, DEBUG_TOKEN_DEFAULT_SCOPE,
+};
 use super::fabric_trait::Fabric as FabricTrait;
 use super::mechanical::{AcquireResult, EditReceipt, MechanicalLockTable};
+use super::observability::{
+    edit_mode_label, subscription_state, write_outcome_label, write_type,
+    METRIC_FABRIC_CONSENSUS_RESOLUTION_SECONDS, METRIC_FABRIC_SNAPSHOT_LOCK_HELD,
+    METRIC_FABRIC_SUBSCRIPTION_COUNT, METRIC_FABRIC_WRITES_TOTAL,
+    METRIC_FABRIC_WRITE_LATENCY_SECONDS, METRIC_FABRIC_ATTESTATION_VERIFICATIONS_TOTAL,
+};
 use super::semantic::{
     CheckoutEntry, CheckoutHandle, CheckoutStatus, ConsensusSnapshot, FinalizeError,
     FinalizeOutcome, ProposalEntry, ProposalHandle, ProposalRegisterError, ProposalStatus,
@@ -39,7 +49,10 @@ use super::subscription::{
     Callback, DispatchConfig, DispatchPool, Predicate, SubscribeError, SubscriptionId,
     SubscriptionRegistry, SubscriptionState,
 };
+use metrics::{counter, gauge, histogram};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
+use tracing::{debug, info_span, warn};
 
 /// Inner state of the bridge fabric. All mutations go through the
 /// outer `RwLock` on `BridgeFabric`.
@@ -173,6 +186,109 @@ impl BridgeFabric {
         let guard = self.state.read().expect("FabricState poisoned");
         f(&guard.inner)
     }
+
+    // ── Debug accessors (Spec 8 §8.5.3) ────────────────────────────
+    //
+    // These produce structured snapshots that the HTTP `/debug/fabric/*`
+    // endpoints (in nabu) serialize to operators. Gating to localhost or
+    // an admin token (`DebugToken::verify`) is the HTTP layer's job; the
+    // accessors themselves are unauthenticated so they remain testable
+    // and reusable from in-process tooling.
+
+    /// `GET /debug/fabric/state` — top-level fabric summary.
+    pub fn debug_state(&self) -> FabricStateSnapshot {
+        let guard = self.state.read().expect("FabricState poisoned");
+        let node_count = guard.inner.node_count();
+        let edge_count = guard.inner.edge_count();
+        let region_count = guard
+            .inner
+            .nodes()
+            .filter_map(|(_, n)| n.causal_position.as_ref().map(|p| p.namespace.uuid))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let genesis = guard.inner.genesis();
+        FabricStateSnapshot {
+            node_count,
+            edge_count,
+            region_count,
+            subscription_count: self.subscriptions.count(),
+            genesis_present: genesis.is_some(),
+            training_complete: genesis.map(|g| g.training_complete()),
+            current_lamport: guard.inner.current_timestamp().value(),
+        }
+    }
+
+    /// `GET /debug/fabric/subscriptions` — list active subscriptions
+    /// with their runtime state (queue depth, panic count, lagged).
+    pub fn debug_subscriptions(&self) -> Vec<SubscriptionState> {
+        self.subscriptions
+            .snapshot()
+            .iter()
+            .filter_map(|entry| self.subscriptions.state(entry.id))
+            .collect()
+    }
+
+    /// `GET /debug/fabric/node/<reference>` — full per-node detail.
+    /// Returns `None` if the node is absent or has no causal position
+    /// (which would mean it bypassed `Fabric::create` — shouldn't happen
+    /// for bridge-managed nodes).
+    pub fn debug_node(&self, id: &LineageId) -> Option<NodeDebugDetail> {
+        let guard = self.state.read().expect("FabricState poisoned");
+        let node = guard.inner.get_node(id)?;
+        let identity = guard.inner.node_identity(id)?;
+        let edit_mode = guard.edit_modes.get(id).copied();
+        Some(NodeDebugDetail {
+            identity,
+            edit_mode,
+            want: node.want.description.clone(),
+            constraint_count: node.constraints.constraints.len(),
+            edges_out: guard.inner.edges_from(id).len(),
+            edges_in: guard.inner.edges_to(id).len(),
+            quarantine_state: NodeQuarantineLabel::from_state(&node.quarantine),
+            has_node_signature: node.node_signature.is_some(),
+            version: node.version(),
+        })
+    }
+
+    // ── Admin tokens (Spec 8 §8.5.3 Cantrill C.3 fold) ─────────────
+
+    /// Issue a 1-hour Ed25519-signed debug token. The signing key is
+    /// the operator's bootstrap key (in production: Jeremy's). Token
+    /// validates against the operator's voice print at the endpoint.
+    pub fn issue_debug_token(&self, operator: &AgentKeypair) -> DebugToken {
+        DebugToken::issue(operator, DEBUG_TOKEN_DEFAULT_SCOPE, DEBUG_TOKEN_DEFAULT_LIFETIME)
+    }
+
+    /// Verify an incoming token against the operator's voice print.
+    /// Convenience wrapper around `DebugToken::verify` so the HTTP
+    /// layer doesn't need to know about scopes.
+    pub fn verify_debug_token(
+        &self,
+        token: &DebugToken,
+        operator: &crate::identity::VoicePrint,
+    ) -> Result<(), super::debug::DebugTokenError> {
+        token.verify(operator, DEBUG_TOKEN_DEFAULT_SCOPE)
+    }
+
+    /// Verify a per-node signature on a high-sensitivity node and
+    /// emit the `fabric_attestation_verifications_total{outcome}`
+    /// metric. Wraps the inner `Fabric::verify_node_signature` so
+    /// operators reading metrics see the verification rate.
+    pub fn verify_node_signature_metered(&self, id: &LineageId) -> Option<bool> {
+        let guard = self.state.read().expect("FabricState poisoned");
+        let result = guard.inner.verify_node_signature(id);
+        let outcome = match result {
+            Some(true) => "verified",
+            Some(false) => "failed",
+            None => "unsigned",
+        };
+        counter!(
+            METRIC_FABRIC_ATTESTATION_VERIFICATIONS_TOTAL,
+            "outcome" => outcome,
+        )
+        .increment(1);
+        result
+    }
 }
 
 impl Default for BridgeFabric {
@@ -188,9 +304,22 @@ impl FabricTrait for BridgeFabric {
         edit_mode: EditMode,
         signer: Option<&AgentKeypair>,
     ) -> Result<LineageId, WriteError> {
-        // Acquire the write lock briefly. We clone the freshly-stored
-        // node out of the lock so dispatch can run without holding it.
-        let (lineage_id, dispatched_node) = {
+        // Spec 8 §8.5.1 — every public trait method opens a span.
+        // `signer_pubkey_fingerprint` is the first 16 hex chars of the
+        // signer's voice print, matching the field naming in the spec.
+        let span = info_span!(
+            "fabric::create",
+            edit_mode = edit_mode_label(edit_mode),
+            region = %self.default_namespace.name,
+            signer_pubkey_fingerprint = signer
+                .map(|kp| short_voice(&kp.voice_print()))
+                .unwrap_or_else(|| "<unsigned>".into()),
+        );
+        let _enter = span.enter();
+        let started = Instant::now();
+        let mode_label = edit_mode_label(edit_mode);
+
+        let result = (|| -> Result<(LineageId, IntentNode), WriteError> {
             let mut guard = self.state.write().expect("FabricState poisoned");
             let lineage_id =
                 guard.inner.create(content, &self.default_namespace, signer)?;
@@ -200,10 +329,38 @@ impl FabricTrait for BridgeFabric {
                 .get_node(&lineage_id)
                 .cloned()
                 .expect("just-created node must be present");
-            (lineage_id, node_snapshot)
-        };
-        self.dispatch_to_subscribers(&dispatched_node);
-        Ok(lineage_id)
+            Ok((lineage_id, node_snapshot))
+        })();
+
+        let outcome_label = write_outcome_label(&result);
+        counter!(
+            METRIC_FABRIC_WRITES_TOTAL,
+            "type" => mode_label,
+            "region" => self.default_namespace.name.clone(),
+            "outcome" => outcome_label,
+        )
+        .increment(1);
+
+        match result {
+            Ok((lineage_id, dispatched_node)) => {
+                histogram!(
+                    METRIC_FABRIC_WRITE_LATENCY_SECONDS,
+                    "type" => mode_label,
+                )
+                .record(started.elapsed().as_secs_f64());
+                debug!(
+                    lineage_id = %lineage_id,
+                    "fabric::create committed"
+                );
+                drop(_enter);
+                self.dispatch_to_subscribers(&dispatched_node);
+                Ok(lineage_id)
+            }
+            Err(err) => {
+                warn!(error = %err, "fabric::create rejected");
+                Err(err)
+            }
+        }
     }
 
     fn edit_mechanical<F>(
@@ -215,6 +372,14 @@ impl FabricTrait for BridgeFabric {
     where
         F: FnOnce(&mut IntentNode),
     {
+        let span = info_span!(
+            "fabric::edit_mechanical",
+            target_id = %target,
+            signer_pubkey_fingerprint = %short_voice(&signer.voice_print()),
+        );
+        let _enter = span.enter();
+        let started = Instant::now();
+
         // Validate edit mode under a brief read lock — fail before
         // we touch the per-node mutex.
         {
@@ -245,10 +410,20 @@ impl FabricTrait for BridgeFabric {
         // Acquire the per-node lock fail-fast (v1).
         match self.mechanical_locks.try_acquire(target.clone(), signer.voice_print()) {
             AcquireResult::Held(holder) => {
-                return Err(WriteError::NodeLocked {
+                let err = WriteError::NodeLocked {
                     by: holder.holder,
                     until_ns: holder.deadline_ns(),
-                });
+                };
+                warn!(error = %err, "fabric::edit_mechanical contention");
+                let outcome = "node_locked";
+                counter!(
+                    METRIC_FABRIC_WRITES_TOTAL,
+                    "type" => write_type::MECHANICAL,
+                    "region" => self.default_namespace.name.clone(),
+                    "outcome" => outcome,
+                )
+                .increment(1);
+                return Err(err);
             }
             AcquireResult::Acquired => {}
         }
@@ -290,7 +465,25 @@ impl FabricTrait for BridgeFabric {
         })();
 
         self.mechanical_locks.release(target);
+        let outcome_label = write_outcome_label(&outcome);
+        counter!(
+            METRIC_FABRIC_WRITES_TOTAL,
+            "type" => write_type::MECHANICAL,
+            "region" => self.default_namespace.name.clone(),
+            "outcome" => outcome_label,
+        )
+        .increment(1);
         let (receipt, mutated) = outcome?;
+        histogram!(
+            METRIC_FABRIC_WRITE_LATENCY_SECONDS,
+            "type" => write_type::MECHANICAL,
+        )
+        .record(started.elapsed().as_secs_f64());
+        debug!(
+            target_id = %target,
+            "fabric::edit_mechanical committed"
+        );
+        drop(_enter);
         self.dispatch_to_subscribers(&mutated);
         Ok(receipt)
     }
@@ -302,6 +495,15 @@ impl FabricTrait for BridgeFabric {
         ttl: Duration,
         signer: &AgentKeypair,
     ) -> Result<CheckoutHandle, WriteError> {
+        let span = info_span!(
+            "fabric::checkout",
+            target_id = %target,
+            ttl_ms = ttl.as_millis() as u64,
+            signer_pubkey_fingerprint = %short_voice(&signer.voice_print()),
+        );
+        let _enter = span.enter();
+        let started = Instant::now();
+
         // Validate the target exists and is Semantic-mode.
         {
             let guard = self.state.read().expect("FabricState poisoned");
@@ -357,8 +559,28 @@ impl FabricTrait for BridgeFabric {
             (id, stored)
         };
 
-        match self.semantic_state.try_register_checkout(checkout_id.clone(), entry) {
+        let result = self.semantic_state.try_register_checkout(checkout_id.clone(), entry);
+        let outcome_label = match &result {
+            Ok(()) => "success",
+            Err(()) => "snapshot_in_progress",
+        };
+        counter!(
+            METRIC_FABRIC_WRITES_TOTAL,
+            "type" => write_type::CHECKOUT,
+            "region" => self.default_namespace.name.clone(),
+            "outcome" => outcome_label,
+        )
+        .increment(1);
+
+        match result {
             Ok(()) => {
+                histogram!(
+                    METRIC_FABRIC_WRITE_LATENCY_SECONDS,
+                    "type" => write_type::CHECKOUT,
+                )
+                .record(started.elapsed().as_secs_f64());
+                debug!(checkout_id = %checkout_id, "fabric::checkout opened");
+                drop(_enter);
                 self.dispatch_to_subscribers(&dispatched_node);
                 Ok(CheckoutHandle {
                     id: checkout_id,
@@ -366,7 +588,10 @@ impl FabricTrait for BridgeFabric {
                     status: CheckoutStatus::Open,
                 })
             }
-            Err(()) => Err(WriteError::SnapshotInProgress),
+            Err(()) => {
+                warn!("fabric::checkout rejected (snapshot in progress)");
+                Err(WriteError::SnapshotInProgress)
+            }
         }
     }
 
@@ -376,6 +601,14 @@ impl FabricTrait for BridgeFabric {
         content: IntentNode,
         signer: &AgentKeypair,
     ) -> Result<ProposalHandle, WriteError> {
+        let span = info_span!(
+            "fabric::propose",
+            checkout_id = %checkout,
+            signer_pubkey_fingerprint = %short_voice(&signer.voice_print()),
+        );
+        let _enter = span.enter();
+        let started = Instant::now();
+
         // Materialize the Proposal as a fabric node first so it has a
         // LineageId we can use to register state.
         let target = {
@@ -418,11 +651,33 @@ impl FabricTrait for BridgeFabric {
             status: ProposalStatus::Draft,
         };
 
-        match self
+        let register_result = self
             .semantic_state
-            .register_proposal(proposal_id.clone(), target, checkout.clone(), entry)
-        {
+            .register_proposal(proposal_id.clone(), target, checkout.clone(), entry);
+
+        let outcome_label = match &register_result {
+            Ok(_) => "success",
+            Err(ProposalRegisterError::CheckoutNotFound)
+            | Err(ProposalRegisterError::CheckoutExpired) => "checkout_expired",
+            Err(ProposalRegisterError::CheckoutClosed) => "fabric_internal",
+        };
+        counter!(
+            METRIC_FABRIC_WRITES_TOTAL,
+            "type" => write_type::PROPOSAL,
+            "region" => self.default_namespace.name.clone(),
+            "outcome" => outcome_label,
+        )
+        .increment(1);
+
+        match register_result {
             Ok(_predecessor) => {
+                histogram!(
+                    METRIC_FABRIC_WRITE_LATENCY_SECONDS,
+                    "type" => write_type::PROPOSAL,
+                )
+                .record(started.elapsed().as_secs_f64());
+                debug!(proposal_id = %proposal_id, "fabric::propose drafted");
+                drop(_enter);
                 self.dispatch_to_subscribers(&proposal_snapshot);
                 Ok(ProposalHandle {
                     id: proposal_id,
@@ -447,6 +702,13 @@ impl FabricTrait for BridgeFabric {
         proposal: &LineageId,
         _signer: &AgentKeypair,
     ) -> Result<Option<ConsensusSnapshot>, WriteError> {
+        let span = info_span!(
+            "fabric::finalize_proposal",
+            proposal_id = %proposal,
+        );
+        let _enter = span.enter();
+        let started = Instant::now();
+
         let outcome = self
             .semantic_state
             .record_finalize(proposal)
@@ -466,12 +728,26 @@ impl FabricTrait for BridgeFabric {
             })?;
 
         match outcome {
-            FinalizeOutcome::StillPending => Ok(None),
+            FinalizeOutcome::StillPending => {
+                counter!(
+                    METRIC_FABRIC_WRITES_TOTAL,
+                    "type" => write_type::FINALIZE,
+                    "region" => self.default_namespace.name.clone(),
+                    "outcome" => "success",
+                )
+                .increment(1);
+                histogram!(
+                    METRIC_FABRIC_WRITE_LATENCY_SECONDS,
+                    "type" => write_type::FINALIZE,
+                )
+                .record(started.elapsed().as_secs_f64());
+                debug!("fabric::finalize_proposal pending — round still open");
+                Ok(None)
+            }
             FinalizeOutcome::SnapshotReady(finalized_proposals) => {
-                // The SnapshotLock is held. Write the ConsensusSnapshot
-                // node into the inner fabric, then release the lock.
-                // Per Spec 8 §3.4.3 the lock budget is 50ms; the inner
-                // create is ~µs, well under budget.
+                // SnapshotLock is held. The §3.4.3 budget is 50ms.
+                gauge!(METRIC_FABRIC_SNAPSHOT_LOCK_HELD).set(1.0);
+
                 let target = self
                     .semantic_state
                     .target_of_proposal(proposal)
@@ -498,6 +774,43 @@ impl FabricTrait for BridgeFabric {
 
                 self.semantic_state
                     .release_snapshot_lock(&target, snapshot_id.clone());
+                gauge!(METRIC_FABRIC_SNAPSHOT_LOCK_HELD).set(0.0);
+
+                let resolution_secs = started.elapsed().as_secs_f64();
+                histogram!(METRIC_FABRIC_CONSENSUS_RESOLUTION_SECONDS).record(resolution_secs);
+                histogram!(
+                    METRIC_FABRIC_WRITE_LATENCY_SECONDS,
+                    "type" => write_type::FINALIZE,
+                )
+                .record(resolution_secs);
+                counter!(
+                    METRIC_FABRIC_WRITES_TOTAL,
+                    "type" => write_type::FINALIZE,
+                    "region" => self.default_namespace.name.clone(),
+                    "outcome" => "success",
+                )
+                .increment(1);
+                counter!(
+                    METRIC_FABRIC_WRITES_TOTAL,
+                    "type" => write_type::CONSENSUS_SNAPSHOT,
+                    "region" => self.default_namespace.name.clone(),
+                    "outcome" => "success",
+                )
+                .increment(1);
+
+                if resolution_secs * 1000.0 > self.semantic_config.snapshot_lock_budget.as_millis() as f64 {
+                    warn!(
+                        resolution_ms = resolution_secs * 1000.0,
+                        budget_ms = self.semantic_config.snapshot_lock_budget.as_millis() as u64,
+                        "fabric::finalize_proposal exceeded snapshot lock budget (Spec 8 §3.4.3)"
+                    );
+                }
+                debug!(
+                    snapshot_id = %snapshot_id,
+                    proposals = finalized_proposals.len(),
+                    "fabric::finalize_proposal wrote ConsensusSnapshot"
+                );
+                drop(_enter);
 
                 // Dispatch the ConsensusSnapshot AFTER releasing the
                 // SnapshotLock so a subscriber that immediately opens a
@@ -534,16 +847,40 @@ impl FabricTrait for BridgeFabric {
         pattern: Predicate,
         callback: Callback,
     ) -> Result<SubscriptionId, SubscribeError> {
-        self.subscriptions.add(pattern, callback)
+        let span = info_span!("fabric::subscribe");
+        let _enter = span.enter();
+        let id = self.subscriptions.add(pattern, callback)?;
+        gauge!(
+            METRIC_FABRIC_SUBSCRIPTION_COUNT,
+            "state" => subscription_state::ACTIVE,
+        )
+        .set(self.subscriptions.count() as f64);
+        debug!(subscription_id = %id, "fabric::subscribe registered");
+        Ok(id)
     }
 
     fn unsubscribe(&self, id: SubscriptionId) -> Result<(), SubscribeError> {
-        self.subscriptions.remove(id)
+        let span = info_span!("fabric::unsubscribe", subscription_id = %id);
+        let _enter = span.enter();
+        self.subscriptions.remove(id)?;
+        gauge!(
+            METRIC_FABRIC_SUBSCRIPTION_COUNT,
+            "state" => subscription_state::ACTIVE,
+        )
+        .set(self.subscriptions.count() as f64);
+        debug!("fabric::unsubscribe removed");
+        Ok(())
     }
 
     fn subscription_state(&self, id: SubscriptionId) -> Option<SubscriptionState> {
         self.subscriptions.state(id)
     }
+}
+
+// ── Tracing helpers ───────────────────────────────────────────────
+
+fn short_voice(voice: &crate::identity::VoicePrint) -> String {
+    voice.to_hex()[..16.min(voice.to_hex().len())].to_string()
 }
 
 // ── Node-shape helpers ────────────────────────────────────────────
@@ -1203,5 +1540,125 @@ mod tests {
                 >= 1),
             "Subscriber should observe the ConsensusSnapshot node"
         );
+    }
+
+    // ── Spec 8 §8.5 Observability ──
+
+    #[test]
+    fn debug_state_reflects_current_fabric() {
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+
+        let initial = bridge.debug_state();
+        assert_eq!(initial.node_count, 0);
+        assert_eq!(initial.subscription_count, 0);
+        assert!(!initial.genesis_present);
+
+        // Add some nodes + a subscription, snapshot updates.
+        bridge
+            .create(IntentNode::new("a"), EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+        bridge
+            .create(IntentNode::new("b"), EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+
+        let pat: Predicate = std::sync::Arc::new(|_| true);
+        let cb: Callback = std::sync::Arc::new(|_, _| CallbackResult::Success);
+        let _ = bridge.subscribe(pat, cb).unwrap();
+
+        let after = bridge.debug_state();
+        assert_eq!(after.node_count, 2);
+        assert_eq!(after.subscription_count, 1);
+        assert!(after.current_lamport >= initial.current_lamport);
+    }
+
+    #[test]
+    fn debug_node_returns_full_detail() {
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+        let id = bridge
+            .create(
+                IntentNode::new("audit entry"),
+                EditMode::Mechanical,
+                Some(&agent),
+            )
+            .unwrap();
+        bridge
+            .edit_mechanical(&id, &agent, |node| {
+                node.constraints.add_hard("must be observable");
+            })
+            .unwrap();
+
+        let detail = bridge.debug_node(&id).expect("node detail available");
+        assert_eq!(detail.want, "audit entry");
+        assert_eq!(detail.edit_mode, Some(EditMode::Mechanical));
+        assert_eq!(detail.constraint_count, 1);
+        assert_eq!(detail.quarantine_state, NodeQuarantineLabel::Normal);
+        assert!(detail.version >= 1);
+        assert_eq!(detail.identity.creator_voice, Some(agent.voice_print()));
+    }
+
+    #[test]
+    fn debug_node_returns_none_for_unknown() {
+        let bridge = fresh_bridge();
+        let result = bridge.debug_node(&LineageId::new());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn debug_subscriptions_lists_active() {
+        let bridge = fresh_bridge();
+        let pat: Predicate = std::sync::Arc::new(|_| true);
+        let cb: Callback = std::sync::Arc::new(|_, _| CallbackResult::Success);
+        let _ = bridge.subscribe(std::sync::Arc::clone(&pat), std::sync::Arc::clone(&cb)).unwrap();
+        let _ = bridge.subscribe(pat, cb).unwrap();
+        let states = bridge.debug_subscriptions();
+        assert_eq!(states.len(), 2);
+        for state in &states {
+            assert_eq!(state.queue_depth, 0);
+            assert_eq!(state.panic_count, 0);
+        }
+    }
+
+    #[test]
+    fn issue_and_verify_debug_token_round_trip() {
+        let bridge = fresh_bridge();
+        let operator = generate_agent_keypair();
+        let token = bridge.issue_debug_token(&operator);
+        assert!(bridge.verify_debug_token(&token, &operator.voice_print()).is_ok());
+
+        // Different operator key fails.
+        let other = generate_agent_keypair();
+        assert!(bridge
+            .verify_debug_token(&token, &other.voice_print())
+            .is_err());
+    }
+
+    #[test]
+    fn verify_node_signature_metered_returns_correct_outcome() {
+        // Setup: high-sensitivity region with a signed node. Because the
+        // bridge's default namespace is Normal sensitivity, we reach into
+        // the inner fabric to register propmgmt as High and create the
+        // signed node directly. CRITICAL: drop the write guard BEFORE
+        // calling `verify_node_signature_metered`, which itself takes a
+        // read lock on the same RwLock — same-thread upgrade would
+        // deadlock std::sync::RwLock.
+        let bridge = fresh_bridge();
+        let agent = generate_agent_keypair();
+        let propmgmt = NamespaceId::fresh("propmgmt");
+        let id = {
+            let mut guard = bridge.state.write().unwrap();
+            guard.inner.set_region_sensitivity(
+                propmgmt.clone(),
+                crate::identity::RegionSensitivity::High,
+            );
+            guard
+                .inner
+                .create(IntentNode::new("financial"), &propmgmt, Some(&agent))
+                .unwrap()
+        };
+
+        let result = bridge.verify_node_signature_metered(&id);
+        assert_eq!(result, Some(true));
     }
 }

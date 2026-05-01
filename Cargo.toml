@@ -29,6 +29,15 @@ blake3 = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["std"] }
 
+# Observability — structured tracing + metrics primitives (Spec 8 §8.5).
+# `tracing` macros open spans on every public bridge method and emit
+# structured events. `metrics` declares counter/gauge/histogram handles
+# that downstream consumers (Nabu via metrics-exporter-prometheus) can
+# scrape; without an exporter installed, the macros are no-ops, so the
+# library stays drop-in for callers that don't care about telemetry.
+tracing = "0.1"
+metrics = "0.24"
+
 [lib]
 name = "ecphory"
 path = "src/lib.rs"

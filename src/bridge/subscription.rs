@@ -33,6 +33,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::node::IntentNode;
+use metrics::{counter, histogram};
+
+use super::observability::{
+    METRIC_FABRIC_PANIC_TOTAL, METRIC_FABRIC_SUBSCRIPTION_CALLBACK_LATENCY_SECONDS,
+};
 
 // ── Public types ──────────────────────────────────────────────────
 
@@ -349,18 +354,26 @@ fn run_task(task: DispatchTask, rx: &Arc<Mutex<Receiver<DispatchTask>>>, retry_b
 
     // Per Spec 8 §2.6.1: catch panics at the callback boundary so they
     // can't propagate into Nabu's request handlers.
+    let started = std::time::Instant::now();
     let invoke_result = {
         let cb = Arc::clone(&entry.callback);
         let node_ref = &node;
         let ctx = context.clone();
         catch_unwind(AssertUnwindSafe(move || cb(node_ref, ctx)))
     };
+    histogram!(METRIC_FABRIC_SUBSCRIPTION_CALLBACK_LATENCY_SECONDS)
+        .record(started.elapsed().as_secs_f64());
 
     let result = match invoke_result {
         Ok(r) => r,
         Err(panic_payload) => {
             let panic_message = panic_message(&panic_payload);
             entry.panic_count.fetch_add(1, Ordering::Relaxed);
+            counter!(
+                METRIC_FABRIC_PANIC_TOTAL,
+                "location" => "subscription_callback",
+            )
+            .increment(1);
             // Spec 8 §6.B.2: panics surface as a SubscriptionPanic event
             // observable by the immune system. Spec 6 isn't built yet,
             // so for v1 we log structured. The event's structured shape

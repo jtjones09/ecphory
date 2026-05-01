@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ecphory::bridge::{
-    BridgeFabric, Callback, CallbackResult, FabricTrait, Predicate,
+    BridgeFabric, Callback, CallbackResult, DebugToken, DebugTokenError, FabricTrait, Predicate,
+    DEBUG_TOKEN_DEFAULT_LIFETIME, DEBUG_TOKEN_DEFAULT_SCOPE,
 };
 use ecphory::{
     generate_agent_keypair, EditMode, IntentNode, MetadataValue, WriteError,
@@ -308,6 +309,62 @@ fn slow_subscriber_does_not_block_request_path() {
         "Write returned in {:?}; must not wait on the dispatch pool's slow callback",
         elapsed
     );
+}
+
+// ── Step 5: observability — debug accessors + admin tokens ──
+
+#[test]
+fn debug_state_reflects_fabric_growth() {
+    let bridge = BridgeFabric::new();
+    let agent = generate_agent_keypair();
+    let initial = bridge.debug_state();
+    assert_eq!(initial.node_count, 0);
+    for i in 0..5 {
+        bridge
+            .create(
+                IntentNode::new(format!("event {}", i)),
+                EditMode::AppendOnly,
+                Some(&agent),
+            )
+            .unwrap();
+    }
+    let snapshot = bridge.debug_state();
+    assert_eq!(snapshot.node_count, 5);
+    assert!(snapshot.current_lamport > initial.current_lamport);
+}
+
+#[test]
+fn debug_subscriptions_reflects_active_count() {
+    let bridge = BridgeFabric::new();
+    let pat: Predicate = Arc::new(|_| true);
+    let cb: Callback = Arc::new(|_, _| CallbackResult::Success);
+    assert_eq!(bridge.debug_subscriptions().len(), 0);
+    let id1 = bridge.subscribe(Arc::clone(&pat), Arc::clone(&cb)).unwrap();
+    let _id2 = bridge.subscribe(Arc::clone(&pat), Arc::clone(&cb)).unwrap();
+    assert_eq!(bridge.debug_subscriptions().len(), 2);
+    bridge.unsubscribe(id1).unwrap();
+    assert_eq!(bridge.debug_subscriptions().len(), 1);
+}
+
+#[test]
+fn admin_token_round_trip() {
+    let bridge = BridgeFabric::new();
+    let operator = generate_agent_keypair();
+    let token = bridge.issue_debug_token(&operator);
+    assert!(bridge.verify_debug_token(&token, &operator.voice_print()).is_ok());
+    // Different key fails.
+    let mallory = generate_agent_keypair();
+    let result = bridge.verify_debug_token(&token, &mallory.voice_print());
+    assert_eq!(result.unwrap_err(), DebugTokenError::UnknownIssuer);
+}
+
+#[test]
+fn admin_token_default_lifetime_one_hour() {
+    let operator = generate_agent_keypair();
+    let token = DebugToken::issue(&operator, DEBUG_TOKEN_DEFAULT_SCOPE, DEBUG_TOKEN_DEFAULT_LIFETIME);
+    let window = token.expires_at_ns - token.issued_at_ns;
+    assert_eq!(window, DEBUG_TOKEN_DEFAULT_LIFETIME.as_nanos() as i128);
+    assert!(token.remaining_ns() > 0);
 }
 
 #[test]

@@ -22,12 +22,18 @@
 
 pub mod fabric_trait;
 pub mod bridge_fabric;
+pub mod debug;
 pub mod mechanical;
+pub mod observability;
 pub mod semantic;
 pub mod subscription;
 
 pub use fabric_trait::Fabric as FabricTrait;
 pub use bridge_fabric::BridgeFabric;
+pub use debug::{
+    DebugToken, DebugTokenError, FabricStateSnapshot, NodeDebugDetail, NodeQuarantineLabel,
+    DEBUG_TOKEN_DEFAULT_LIFETIME, DEBUG_TOKEN_DEFAULT_SCOPE,
+};
 pub use mechanical::EditReceipt;
 pub use semantic::{
     CheckoutHandle, CheckoutStatus, ConsensusSnapshot, ProposalHandle, ProposalStatus,
