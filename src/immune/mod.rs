@@ -20,12 +20,17 @@
 // specializations. If the ratio inverts, this is an IDS, not a
 // real immune system.
 
+pub mod aggregation;
 pub mod baseline;
 pub mod cell_agent;
 pub mod multidim;
 pub mod specialization;
 
 pub use baseline::WelfordTracker;
+pub use aggregation::{
+    AggregationConfig, AggregationLayer, AggregationOutcome, ConvergedAnomalyRecord,
+    ImmuneResponseMode, ObservationRecord,
+};
 pub use multidim::{
     chi_squared_critical, ledoit_wolf_shrink, trust_modulated_threshold, MatrixError,
     MultivariateBaseline,
