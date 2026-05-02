@@ -1,0 +1,36 @@
+// IMMUNE SYSTEM — The fabric's primary trust mechanism (Spec 6)
+//
+// Per Spec 5 v2.1: behavioral observation REPLACES per-write signature
+// verification for normal regions. The cell-agent population's
+// assessment of an agent's pattern IS what determines trust. This is
+// not a secondary security monitor — the immune system is the trust
+// mechanism (Spec 6 §1).
+//
+// Architecture (Spec 6 §2 — two layers):
+// - Layer 1 (substrate): every fabric action carries identifiable
+//   provenance via Spec 8 §13's content-fingerprint + voice-print
+//   surface. Already shipped.
+// - Layer 2 (cognitive): a population of cell-agent observers, six
+//   specializations per region, that maintain behavioral baselines
+//   and surface anomaly / damage signals. THIS module.
+//
+// Maintenance / defense ratio (COHEN.1 fold): in steady state,
+// ≥80% of cell-agent output is `BaselineHealthy` from maintenance
+// specializations; ≤20% is anomaly / damage from defense
+// specializations. If the ratio inverts, this is an IDS, not a
+// real immune system.
+
+pub mod baseline;
+pub mod cell_agent;
+pub mod specialization;
+
+pub use baseline::WelfordTracker;
+pub use cell_agent::{
+    AnomalyObservation, BaselineHealthy, CellAgent, CellAgentHealth, CellAgentId,
+    DamageObservation, ImmunePattern, ObservationContext, ObservationOutcome,
+    ObservationSeverity, ObservedEvent, RetuneReport,
+};
+pub use specialization::{
+    AttestationObserver, ConsensusObserver, DecayObserver, RateObserver, RelationObserver,
+    SilenceObserver, Specialization,
+};

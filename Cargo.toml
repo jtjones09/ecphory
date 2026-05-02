@@ -38,6 +38,12 @@ rand_core = { version = "0.6", features = ["std"] }
 tracing = "0.1"
 metrics = "0.24"
 
+[dev-dependencies]
+# Deterministic-seeded randomness for the Spec 6 immune-system
+# detection-rate tests. `SmallRng` is fine for statistical tests; we
+# don't need cryptographic-grade randomness in tests.
+rand = { version = "0.8", features = ["small_rng"] }
+
 [lib]
 name = "ecphory"
 path = "src/lib.rs"
