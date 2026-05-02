@@ -22,9 +22,14 @@
 
 pub mod baseline;
 pub mod cell_agent;
+pub mod multidim;
 pub mod specialization;
 
 pub use baseline::WelfordTracker;
+pub use multidim::{
+    chi_squared_critical, ledoit_wolf_shrink, trust_modulated_threshold, MatrixError,
+    MultivariateBaseline,
+};
 pub use cell_agent::{
     AnomalyObservation, BaselineHealthy, CellAgent, CellAgentHealth, CellAgentId,
     DamageObservation, ImmunePattern, ObservationContext, ObservationOutcome,
