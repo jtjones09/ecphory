@@ -17,7 +17,7 @@
 // - EditMode tracked per-node by the bridge (no NodeKind on IntentNode)
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::fabric::Fabric as InnerFabric;
@@ -116,6 +116,33 @@ pub struct BridgeFabric {
     /// True if `P53Scope::Fabric` has been triggered. All writes
     /// thereafter return `WriteError::FabricDegraded`.
     fabric_terminated: std::sync::atomic::AtomicBool,
+
+    // ── Spec 6 immune system runtime integration ─────────────────
+    //
+    // The cell-agent population (Spec 6 §3.2) is registered here.
+    // Every successful write dispatches the committed node through
+    // `dispatch_to_cell_agents`, which routes to each registered
+    // cell-agent's `observe()` method under a per-cell-agent mutex
+    // (KING.1 fold — one cell-agent never has concurrent observe
+    // invocations).
+    //
+    // When a cell-agent emits an Anomaly / Damage signal, the bridge
+    // writes the signal as a fabric node AND evaluates aggregation
+    // atomically with that write — see `commit_immune_signal_atomic`.
+    // The aggregation evaluation (and any resulting ConvergedAnomaly
+    // write) all happen under a single `state.write()` guard so a
+    // concurrent immune signal from another cell-agent cannot slip
+    // between commit + evaluate.
+    /// Registered cell-agents. Per-agent `Mutex` per KING.1.
+    cell_agents: std::sync::RwLock<Vec<std::sync::Arc<Mutex<Box<dyn crate::immune::CellAgent>>>>>,
+    /// Aggregation evaluator (population → decision per Spec 6 §5).
+    aggregation: std::sync::Arc<crate::immune::AggregationLayer>,
+    /// Bridge-internal aggregation key. Used to sign automatic
+    /// `P53Scope::Region` triggers issued by aggregation escalation.
+    /// Per Spec 6 §5.2.4 v1.1 fold this is a privileged
+    /// fabric-aggregation keypair (concession for v1; v2 replaces
+    /// with quorum attestation from the convergent cell-agents).
+    immune_aggregation_key: AgentKeypair,
 }
 
 impl BridgeFabric {
@@ -148,6 +175,9 @@ impl BridgeFabric {
             p53_config: P53Config::default(),
             decay_config: DecayConfig::default(),
             fabric_terminated: std::sync::atomic::AtomicBool::new(false),
+            cell_agents: std::sync::RwLock::new(Vec::new()),
+            aggregation: std::sync::Arc::new(crate::immune::AggregationLayer::new()),
+            immune_aggregation_key: crate::identity::generate_agent_keypair(),
         }
     }
 
@@ -169,6 +199,257 @@ impl BridgeFabric {
     /// too.
     pub fn shutdown(&self) {
         self.dispatch_pool.shutdown();
+    }
+
+    // ── Spec 6 immune-system integration (Task 1) ────────────────
+
+    /// Register a cell-agent with the bridge. After registration, the
+    /// agent's `observe()` is called on every successful write that
+    /// reaches `dispatch_to_cell_agents` (i.e., every non-immune-signal
+    /// write). Returns the agent's stable `CellAgentId`.
+    pub fn register_cell_agent(
+        &self,
+        agent: Box<dyn crate::immune::CellAgent>,
+    ) -> crate::immune::CellAgentId {
+        let id = agent.id();
+        let mut agents = self
+            .cell_agents
+            .write()
+            .expect("cell_agents poisoned");
+        agents.push(std::sync::Arc::new(Mutex::new(agent)));
+        id
+    }
+
+    /// Read-only access to the aggregation layer. Tests + operators
+    /// (via /debug/fabric/immune) consult it for region modes and
+    /// pending convergence state.
+    pub fn aggregation_layer(&self) -> &crate::immune::AggregationLayer {
+        &self.aggregation
+    }
+
+    /// Voice print of the bridge's internal immune-aggregation key —
+    /// the signer on auto-triggered `P53Scope::Region` events.
+    pub fn immune_aggregation_voice(&self) -> crate::identity::VoicePrint {
+        self.immune_aggregation_key.voice_print()
+    }
+
+    /// Is `node` itself an immune-system signal? Used to suppress
+    /// recursive cell-agent dispatch on AnomalyObservation /
+    /// DamageObservation / BaselineHealthy / ConvergedAnomaly nodes
+    /// the bridge wrote via `commit_immune_signal_atomic`.
+    fn is_immune_signal_node(node: &IntentNode) -> bool {
+        match node.metadata.get(META_NODE_KIND) {
+            Some(MetadataValue::String(kind)) => matches!(
+                kind.as_str(),
+                "AnomalyObservation"
+                    | "DamageObservation"
+                    | "BaselineHealthy"
+                    | "ConvergedAnomaly"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Dispatch a freshly-committed node to every registered
+    /// cell-agent. Each agent's `observe()` runs under its own
+    /// per-agent Mutex per KING.1 — a single agent never sees
+    /// concurrent observe calls — but different agents observe
+    /// concurrently (no global cell-agent lock). When an agent emits
+    /// an Anomaly / Damage / BaselineHealthy outcome, the bridge
+    /// writes the signal via the appropriate atomic path.
+    ///
+    /// Skipped on immune-signal writes to bound recursion to one
+    /// level: a cell-agent's emission produces a node, that node is
+    /// NOT re-dispatched to cell-agents.
+    fn dispatch_to_cell_agents(&self, node: &IntentNode) {
+        if Self::is_immune_signal_node(node) {
+            return;
+        }
+        // Snapshot the Vec<Arc<Mutex<...>>> outside the per-agent
+        // critical sections so the dispatch loop doesn't hold the
+        // outer registration lock while running observe().
+        let agents: Vec<std::sync::Arc<Mutex<Box<dyn crate::immune::CellAgent>>>> = {
+            let guard = self.cell_agents.read().expect("cell_agents poisoned");
+            guard.iter().cloned().collect()
+        };
+        if agents.is_empty() {
+            return;
+        }
+        for agent_arc in agents {
+            // Per-agent observe() under the agent's own Mutex. We
+            // capture region + specialization + outcome, then drop
+            // the per-agent guard before re-entering the bridge's
+            // write paths so we never hold a per-agent lock across
+            // a state.write() acquisition.
+            let (region, specialization, outcome) = {
+                let mut agent = agent_arc.lock().expect("cell_agent poisoned");
+                let ctx = crate::immune::ObservationContext::default();
+                let outcome = agent.observe(crate::immune::ObservedEvent::Node(node), &ctx);
+                (agent.region().clone(), agent.specialization(), outcome)
+            };
+
+            use crate::immune::ObservationOutcome;
+            match outcome {
+                ObservationOutcome::Quiet => {}
+                ObservationOutcome::BaselineHealthy(healthy) => {
+                    let signal = crate::immune::specialization::baseline_healthy_to_node(&healthy);
+                    let _ = self.commit_baseline_healthy(signal, region, specialization);
+                }
+                ObservationOutcome::Anomaly(a) => {
+                    let signal = crate::immune::specialization::anomaly_to_node(&a);
+                    let _ = self.commit_immune_signal_atomic(
+                        signal,
+                        region,
+                        specialization,
+                        /* is_damage = */ false,
+                    );
+                }
+                ObservationOutcome::Damage(d) => {
+                    let signal = crate::immune::specialization::damage_to_node(&d);
+                    let _ = self.commit_immune_signal_atomic(
+                        signal,
+                        region,
+                        specialization,
+                        /* is_damage = */ true,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Write a `BaselineHealthy` signal node. Maintenance signals
+    /// don't go through aggregation — they're recorded for the
+    /// cognitive map / 80/20 audit trail (Spec 6 §4.1).
+    fn commit_baseline_healthy(
+        &self,
+        signal: IntentNode,
+        _region: crate::identity::NamespaceId,
+        _specialization: &'static str,
+    ) -> Result<LineageId, WriteError> {
+        let mut guard = self.state.write().expect("FabricState poisoned");
+        let id = guard.inner.create(signal, &self.default_namespace, None)?;
+        guard.edit_modes.insert(id.clone(), EditMode::AppendOnly);
+        let snapshot = guard.inner.get_node(&id).cloned();
+        drop(guard);
+        if let Some(node) = snapshot {
+            self.dispatch_to_subscribers(&node);
+        }
+        Ok(id)
+    }
+
+    /// **KING.1 atomic transaction** (Spec 6 §5.2 v1.1 fold).
+    ///
+    /// Writes an `AnomalyObservation` / `DamageObservation` signal
+    /// node AND runs aggregation evaluation AND (if convergence is
+    /// reached) writes a `ConvergedAnomaly` node — all under a
+    /// single `state.write()` guard. A concurrent immune signal
+    /// from another cell-agent cannot slip between the signal
+    /// commit and the aggregation evaluation; the per-region
+    /// aggregation mutex inside `AggregationLayer` further bounds
+    /// the per-region serialization.
+    ///
+    /// If aggregation returns `EscalateP53Region` and the region's
+    /// `ImmuneResponseMode` is `Active`, the bridge auto-triggers
+    /// `P53Scope::Region` after the lock is released (p53_trigger
+    /// is itself transactional and runs its own forensic-archive
+    /// + drain pipeline).
+    fn commit_immune_signal_atomic(
+        &self,
+        signal: IntentNode,
+        region: crate::identity::NamespaceId,
+        specialization: &'static str,
+        is_damage: bool,
+    ) -> Result<LineageId, WriteError> {
+        use crate::immune::{AggregationOutcome, ImmuneResponseMode, ObservationRecord};
+
+        // Phase 1: commit the signal node + run aggregation under
+        // the FabricState write guard. ConvergedAnomaly node (if
+        // any) is written before releasing the guard.
+        let (signal_id, converged_id, escalate) = {
+            let mut guard = self.state.write().expect("FabricState poisoned");
+            let signal_id = guard.inner.create(signal, &self.default_namespace, None)?;
+            guard.edit_modes.insert(signal_id.clone(), EditMode::AppendOnly);
+
+            let record = ObservationRecord {
+                at: std::time::Instant::now(),
+                fabric_instant: FabricInstant::now(),
+                specialization: specialization.to_string(),
+                source_node: signal_id.clone(),
+                is_damage,
+            };
+            let outcome = self.aggregation.evaluate(region.clone(), record);
+
+            let mut converged_id_opt: Option<LineageId> = None;
+            let mut escalate_to: Option<(crate::identity::NamespaceId, ImmuneResponseMode)> = None;
+            match outcome {
+                AggregationOutcome::Quiet => {}
+                AggregationOutcome::ConvergedAnomaly {
+                    region: r,
+                    source_observations,
+                    specializations,
+                    had_damage,
+                } => {
+                    let conv_node = build_converged_anomaly_node(
+                        &r,
+                        &source_observations,
+                        &specializations,
+                        had_damage,
+                        self.immune_aggregation_key.voice_print(),
+                    );
+                    let cid = guard.inner.create(conv_node, &self.default_namespace, None)?;
+                    guard.edit_modes.insert(cid.clone(), EditMode::AppendOnly);
+                    converged_id_opt = Some(cid);
+                }
+                AggregationOutcome::EscalateP53Region {
+                    region: r,
+                    source_observations,
+                    specializations,
+                    mode,
+                } => {
+                    // Always write the ConvergedAnomaly node first —
+                    // operators see it whether or not auto-p53 fires.
+                    let conv_node = build_converged_anomaly_node(
+                        &r,
+                        &source_observations,
+                        &specializations,
+                        true, // had_damage is true by Matzinger fold (escalation requires damage)
+                        self.immune_aggregation_key.voice_print(),
+                    );
+                    let cid = guard.inner.create(conv_node, &self.default_namespace, None)?;
+                    guard.edit_modes.insert(cid.clone(), EditMode::AppendOnly);
+                    converged_id_opt = Some(cid);
+                    if mode == ImmuneResponseMode::Active {
+                        escalate_to = Some((r, mode));
+                    }
+                }
+            }
+            (signal_id, converged_id_opt, escalate_to)
+        };
+
+        // Phase 2: dispatch the committed nodes to subscribers
+        // (subscription path; cell-agent recursion is suppressed by
+        // `is_immune_signal_node`). p53_trigger runs after the
+        // FabricState lock is released so its own region-drain +
+        // forensic archive don't race with the lock.
+        if let Some(node) = self.read_inner(|inner| inner.get_node(&signal_id).cloned()) {
+            self.dispatch_to_subscribers(&node);
+        }
+        if let Some(cid) = &converged_id {
+            if let Some(cn) = self.read_inner(|inner| inner.get_node(cid).cloned()) {
+                self.dispatch_to_subscribers(&cn);
+            }
+        }
+        if let Some((escalation_region, _mode)) = escalate {
+            // Fire P53::Region with the bridge's internal aggregation key.
+            // The p53_trigger path handles its own forensic archive +
+            // subscription drain transactionally.
+            let _ = self.p53_trigger(
+                crate::bridge::P53Scope::Region(escalation_region),
+                &self.immune_aggregation_key,
+            );
+        }
+        let _ = converged_id; // shadow keeps clippy happy on unused branches
+        Ok(signal_id)
     }
 
     /// Internal: dispatch a freshly-committed node to all matching
@@ -575,6 +856,7 @@ impl FabricTrait for BridgeFabric {
                 );
                 drop(_enter);
                 self.dispatch_to_subscribers(&dispatched_node);
+                self.dispatch_to_cell_agents(&dispatched_node);
                 Ok(lineage_id)
             }
             Err(err) => {
@@ -706,6 +988,7 @@ impl FabricTrait for BridgeFabric {
         );
         drop(_enter);
         self.dispatch_to_subscribers(&mutated);
+        self.dispatch_to_cell_agents(&mutated);
         Ok(receipt)
     }
 
@@ -803,6 +1086,7 @@ impl FabricTrait for BridgeFabric {
                 debug!(checkout_id = %checkout_id, "fabric::checkout opened");
                 drop(_enter);
                 self.dispatch_to_subscribers(&dispatched_node);
+                self.dispatch_to_cell_agents(&dispatched_node);
                 Ok(CheckoutHandle {
                     id: checkout_id,
                     target: target.clone(),
@@ -900,6 +1184,7 @@ impl FabricTrait for BridgeFabric {
                 debug!(proposal_id = %proposal_id, "fabric::propose drafted");
                 drop(_enter);
                 self.dispatch_to_subscribers(&proposal_snapshot);
+                self.dispatch_to_cell_agents(&proposal_snapshot);
                 Ok(ProposalHandle {
                     id: proposal_id,
                     checkout: checkout.clone(),
@@ -1037,6 +1322,7 @@ impl FabricTrait for BridgeFabric {
                 // SnapshotLock so a subscriber that immediately opens a
                 // new checkout doesn't see SnapshotInProgress.
                 self.dispatch_to_subscribers(&snapshot_snapshot);
+                self.dispatch_to_cell_agents(&snapshot_snapshot);
 
                 Ok(Some(ConsensusSnapshot {
                     id: snapshot_id,
@@ -1534,6 +1820,53 @@ fn build_p53_event_node(
             MetadataValue::String(t),
         );
     }
+    node.recompute_signature();
+    node
+}
+
+/// Build a `ConvergedAnomaly` fabric node — emitted by
+/// `commit_immune_signal_atomic` when N cell-agents of distinct
+/// specializations converge on a region within the convergence
+/// window (Spec 6 §5.2.1).
+fn build_converged_anomaly_node(
+    region: &crate::identity::NamespaceId,
+    source_observations: &[LineageId],
+    specializations: &[String],
+    had_damage: bool,
+    aggregation_voice: crate::identity::VoicePrint,
+) -> IntentNode {
+    let summary = format!(
+        "ConvergedAnomaly in {} — {} specializations, damage={}",
+        region.name,
+        specializations.len(),
+        had_damage
+    );
+    let mut node = IntentNode::new(summary).with_creator_voice(aggregation_voice);
+    node.metadata.insert(
+        META_NODE_KIND.into(),
+        MetadataValue::String("ConvergedAnomaly".into()),
+    );
+    node.metadata.insert(
+        "__immune_region__".into(),
+        MetadataValue::String(region.name.clone()),
+    );
+    node.metadata.insert(
+        "__immune_specializations__".into(),
+        MetadataValue::String(specializations.join(",")),
+    );
+    node.metadata.insert(
+        "__immune_had_damage__".into(),
+        MetadataValue::Bool(had_damage),
+    );
+    let sources_csv: String = source_observations
+        .iter()
+        .map(|id| id.as_uuid().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    node.metadata.insert(
+        "__immune_source_observations__".into(),
+        MetadataValue::String(sources_csv),
+    );
     node.recompute_signature();
     node
 }
