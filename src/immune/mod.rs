@@ -22,7 +22,11 @@
 
 pub mod aggregation;
 pub mod baseline;
+pub mod bootstrap;
 pub mod cell_agent;
+pub mod cognitive_map;
+pub mod health;
+pub mod inheritance;
 pub mod multidim;
 pub mod specialization;
 
@@ -31,6 +35,12 @@ pub use aggregation::{
     AggregationConfig, AggregationLayer, AggregationOutcome, ConvergedAnomalyRecord,
     ImmuneResponseMode, ObservationRecord,
 };
+pub use bootstrap::{
+    bootstrap_region, enforce_population, CellAgentManifest, MissingPopulation,
+    RegionProvisionReport, V1_SPECIALIZATIONS,
+};
+pub use cognitive_map::{AnomalyCluster, CognitiveMap, StateVector};
+pub use inheritance::BaselineSnapshot;
 pub use multidim::{
     chi_squared_critical, ledoit_wolf_shrink, trust_modulated_threshold, MatrixError,
     MultivariateBaseline,

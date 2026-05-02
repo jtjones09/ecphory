@@ -51,3 +51,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "intent"
 path = "src/bin/intent.rs"
+
+[[bin]]
+name = "immune-bootstrap"
+path = "src/bin/immune-bootstrap.rs"

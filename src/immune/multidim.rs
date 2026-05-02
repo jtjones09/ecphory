@@ -258,7 +258,9 @@ impl MultivariateBaseline {
 /// analytically to minimize MSE in the LW (2004) sense. v1 uses the
 /// simplified closed form
 ///
+/// ```text
 ///     α = min(d² / (d² + b²), 1)
+/// ```
 ///
 /// where `d² = ||s - μ I||²_F` and `b²` is bounded above by `||s||²_F /
 /// n`. With small N this drives α toward 1 (heavily shrunk → identity-
@@ -317,16 +319,20 @@ pub fn ledoit_wolf_shrink(s: &[f64], k: usize, n: u64) -> Vec<f64> {
 ///
 /// v1 uses the Wilson-Hilferty approximation
 ///
+/// ```text
 ///     χ²_p(k) ≈ k * (1 - 2/(9k) + z_p * sqrt(2/(9k)))³
+/// ```
 ///
 /// where `z_p` is the standard normal critical value at upper tail
 /// `p`. Accuracy: <0.5% error for k ≥ 5 and 1e-5 ≤ p ≤ 0.5.
 ///
 /// Exact entries for K=9 (the Spec 5 §5.5.3 target dimensionality):
 ///
+/// ```text
 ///     p=0.01    → χ² = 21.666
 ///     p=0.001   → χ² = 27.877
 ///     p=0.0001  → χ² = 33.720
+/// ```
 pub fn chi_squared_critical(p: f64, k: usize) -> f64 {
     // Exact lookup for K=9 + the three Spec 5 §5.5.3 thresholds.
     if k == 9 {
