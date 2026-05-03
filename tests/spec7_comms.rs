@@ -1112,6 +1112,147 @@ fn comms_degradation_falls_back_to_operational_region_then_replays_on_recovery()
 }
 
 #[test]
+fn log_projection_writes_messages_with_correct_urgency_and_dnd_default() {
+    // Spec 7 §5 / Step 10: messages written to comms appear in the
+    // projection output with correct urgency labels and DND default
+    // (10 PM – 7 AM) holds non-Immediate messages.
+    use ecphory::bridge::{Callback, CallbackResult, Predicate};
+    use ecphory::comms::{
+        is_comms_message, vec_sink, LogProjection, ProjectionDecision,
+    };
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::time::Duration;
+
+    let bridge = comms_bridge();
+    let agent = generate_agent_keypair();
+
+    // Sink + projection. Hour-of-day is mutated by the test as
+    // simulated wall-clock progression.
+    let (sink, log_buf) = vec_sink();
+    let projection = Arc::new(LogProjection::new(sink));
+    let projection_for_sub = Arc::clone(&projection);
+    let current_hour = Arc::new(AtomicU8::new(14)); // start outside DND
+    let current_hour_for_sub = Arc::clone(&current_hour);
+
+    let pat: Predicate = Arc::new(|node| is_comms_message(node));
+    let cb: Callback = Arc::new(move |node, _ctx| {
+        let hour = current_hour_for_sub.load(Ordering::SeqCst);
+        let _ = projection_for_sub.project(node, hour);
+        CallbackResult::Success
+    });
+    bridge.subscribe(pat, cb).expect("subscribe projection");
+
+    let mk_message = |urgency: Urgency, text: &str| CommsMessage {
+        content: MessageContent::Text(text.into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency,
+        sensitivity: Sensitivity::Normal,
+        references: vec![],
+    };
+
+    // 14:00 — outside DND. Normal-urgency message delivers.
+    bridge
+        .create(
+            mk_message(Urgency::Normal, "lunchtime ping").to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+
+    // Wait for the projection callback to actually run at hour=14
+    // before switching to DND — subscription dispatch is async.
+    let deadline_warmup = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline_warmup {
+        if log_buf.lock().unwrap().len() >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // 02:00 — DND. Background, Normal, Prompt all held; Immediate goes through.
+    current_hour.store(2, Ordering::SeqCst);
+    bridge
+        .create(
+            mk_message(Urgency::Background, "low-priority bg").to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    bridge
+        .create(
+            mk_message(Urgency::Normal, "could-wait normal").to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    bridge
+        .create(
+            mk_message(Urgency::Prompt, "would-like-soon prompt")
+                .to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    bridge
+        .create(
+            mk_message(Urgency::Immediate, "EMERGENCY please look")
+                .to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+
+    // Subscription dispatch is async; wait until projection processes
+    // all 5 writes (1 outside DND + 4 inside, of which 1 immediate).
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let delivered = log_buf.lock().unwrap().len();
+        let pending = projection.pending_count();
+        if delivered + pending >= 5 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Outside-DND Normal + DND Immediate should be delivered (2 lines).
+    {
+        let delivered = log_buf.lock().unwrap();
+        assert_eq!(
+            delivered.len(),
+            2,
+            "expected 2 delivered (outside-DND Normal + DND Immediate); got: {:?}",
+            *delivered
+        );
+        assert!(delivered.iter().any(|l| l.contains("Normal") && l.contains("lunchtime")));
+        assert!(
+            delivered
+                .iter()
+                .any(|l| l.contains("Immediate") && l.contains("EMERGENCY"))
+        );
+    }
+    assert_eq!(
+        projection.pending_count(),
+        3,
+        "Background + Normal + Prompt are held during DND"
+    );
+
+    // 07:00 — DND ends. Flush releases the held messages.
+    let flushed = projection.flush(7);
+    assert_eq!(flushed, 3);
+
+    let delivered = log_buf.lock().unwrap();
+    assert_eq!(delivered.len(), 5);
+    assert!(delivered.iter().any(|l| l.contains("Background") && l.contains("low-priority")));
+    assert!(delivered.iter().any(|l| l.contains("Prompt") && l.contains("would-like-soon")));
+
+    // ProjectionDecision::Skipped is exercised in unit tests; here we
+    // only assert the integrated outcome.
+    let _ = ProjectionDecision::Skipped;
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.
