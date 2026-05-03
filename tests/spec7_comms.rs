@@ -922,6 +922,83 @@ fn opacity_observer_flags_message_with_five_unobserved_refs() {
 }
 
 #[test]
+fn operator_intent_companion_only_for_jeremy_authored_messages() {
+    // Spec 7 §7 / Step 8: a message authored by the operator's voice
+    // gets a companion `OperatorIntent` node so the immune system can
+    // tell "Jeremy told Nabu to do this" from "Nabu decided on its
+    // own." Non-operator messages get no companion.
+    use ecphory::comms::{submit_with_operator_intent, KIND_OPERATOR_INTENT};
+
+    let bridge = comms_bridge();
+    let jeremy = generate_agent_keypair();
+    let nabu = generate_agent_keypair();
+
+    // Jeremy-authored message — companion must be written.
+    let jeremy_msg = CommsMessage {
+        content: MessageContent::Text("please rebuild the MCP tool list".into()),
+        thread: None,
+        mentions: vec![nabu.voice_print()],
+        intent: MessageIntent::Request,
+        urgency: Urgency::Prompt,
+        sensitivity: Sensitivity::Normal,
+        references: vec![],
+    };
+    let (msg_id, intent_id) =
+        submit_with_operator_intent(&bridge, &jeremy_msg, &jeremy, &jeremy.voice_print())
+            .expect("submit jeremy message");
+    let intent_id = intent_id.expect("operator-authored → companion intent must be written");
+
+    let intent_node = bridge.get_node(&intent_id).unwrap();
+    assert_eq!(
+        intent_node
+            .metadata
+            .get("__bridge_node_kind__")
+            .map(|v| v.as_str_repr()),
+        Some(KIND_OPERATOR_INTENT.into())
+    );
+    assert_eq!(
+        intent_node
+            .metadata
+            .get("__operator_voice__")
+            .map(|v| v.as_str_repr()),
+        Some(jeremy.voice_print().to_hex())
+    );
+    assert_eq!(
+        intent_node
+            .metadata
+            .get("__operator_instruction_node__")
+            .map(|v| v.as_str_repr()),
+        Some(msg_id.as_uuid().to_string())
+    );
+
+    // Edge from intent → message via DerivedFrom.
+    let walked =
+        bridge.traverse(&intent_id, &[ecphory::context::RelationshipKind::DerivedFrom], 5);
+    assert!(
+        walked.contains(&msg_id),
+        "intent must link to message via DerivedFrom edge"
+    );
+
+    // Nabu-authored message with operator = jeremy → no companion.
+    let nabu_msg = CommsMessage {
+        content: MessageContent::Text("done. 12 tools registered.".into()),
+        thread: None,
+        mentions: vec![jeremy.voice_print()],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+        references: vec![],
+    };
+    let (_, no_intent) =
+        submit_with_operator_intent(&bridge, &nabu_msg, &nabu, &jeremy.voice_print())
+            .expect("submit nabu message");
+    assert!(
+        no_intent.is_none(),
+        "non-operator message must not produce a companion OperatorIntent"
+    );
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.

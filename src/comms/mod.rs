@@ -27,6 +27,7 @@ pub mod decision;
 pub mod handoff;
 pub mod message;
 pub mod observe;
+pub mod operator;
 pub mod provenance;
 pub mod thread;
 
@@ -49,6 +50,10 @@ pub use message::{
 };
 pub use observe::{
     is_comms_message, is_mentioned, message_intent, message_mentions_hex, message_urgency,
+};
+pub use operator::{
+    submit_with_operator_intent, OperatorIntent, KIND_OPERATOR_INTENT,
+    META_INSTRUCTION_FINGERPRINT, META_INSTRUCTION_NODE, META_OPERATOR_VOICE,
 };
 pub use thread::{CommsThread, ThreadState, KIND_COMMS_THREAD, META_THREAD_PARTICIPANTS,
     META_THREAD_STATE, META_THREAD_STARTED_BY, META_THREAD_TOPIC};
