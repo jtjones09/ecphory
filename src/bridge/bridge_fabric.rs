@@ -201,6 +201,59 @@ impl BridgeFabric {
         self.dispatch_pool.shutdown();
     }
 
+    // ── Spec 9 cross-region write helper ─────────────────────────
+
+    /// Write a node into a specific namespace rather than the bridge's
+    /// `default_namespace`. Required by Spec 9 — work intents land in
+    /// `hotash:work` and evidence lands in operational regions, but
+    /// the trait `create()` only writes to the default. Mirrors the
+    /// trait's commit + dispatch shape; observability decoration
+    /// (tracing span, metric labels) is deferred to v1.5 polish.
+    pub fn create_in(
+        &self,
+        content: IntentNode,
+        namespace: &NamespaceId,
+        edit_mode: EditMode,
+        signer: Option<&AgentKeypair>,
+    ) -> Result<LineageId, WriteError> {
+        if self.is_terminated() {
+            return Err(WriteError::FabricDegraded);
+        }
+        let (lineage_id, node_snapshot) = {
+            let mut guard = self.state.write().expect("FabricState poisoned");
+            if guard.terminated_regions.contains(namespace) {
+                return Err(WriteError::FabricDegraded);
+            }
+            let id = guard.inner.create(content, namespace, signer)?;
+            guard.edit_modes.insert(id.clone(), edit_mode);
+            let node = guard
+                .inner
+                .get_node(&id)
+                .cloned()
+                .expect("just-created node must be present");
+            (id, node)
+        };
+        // Dispatch happens after the lock release, matching the
+        // trait `create()` ordering.
+        self.dispatch_to_subscribers(&node_snapshot);
+        self.dispatch_to_cell_agents(&node_snapshot);
+        Ok(lineage_id)
+    }
+
+    /// Add a cross-region edge. Spec 9 §3.1 (Fulfills) edges are the
+    /// primary use — evidence in operational regions linked back to
+    /// work intents in `hotash:work`.
+    pub fn add_edge(
+        &self,
+        from: &LineageId,
+        to: &LineageId,
+        weight: f64,
+        kind: crate::context::RelationshipKind,
+    ) -> Result<(), crate::fabric::FabricError> {
+        let mut guard = self.state.write().expect("FabricState poisoned");
+        guard.inner.add_edge(from, to, weight, kind)
+    }
+
     // ── Spec 6 immune-system integration (Task 1) ────────────────
 
     /// Register a cell-agent with the bridge. After registration, the

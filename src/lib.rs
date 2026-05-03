@@ -33,6 +33,7 @@ pub mod persist;
 pub mod embedding;
 pub mod inference;
 pub mod distributed;
+pub mod work;
 
 // Re-export the main types at crate root for convenience
 pub use node::{IntentNode, MetadataValue};

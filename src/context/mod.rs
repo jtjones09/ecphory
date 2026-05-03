@@ -47,6 +47,10 @@ pub enum RelationshipKind {
     Constrains,
     /// Spec 7 §3.2: this message belongs to the target conversation thread
     Thread,
+    /// Spec 9 §3.1: this node is evidence that fulfills a WorkIntent.
+    /// Cross-region by design — evidence lives where the work happens
+    /// (nisaba, propmgmt, etc.), the WorkIntent lives in `hotash:work`.
+    Fulfills,
     /// Custom semantic relationship (Phase 1 escape hatch)
     Custom(String),
 }
