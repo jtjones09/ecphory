@@ -45,6 +45,8 @@ pub enum RelationshipKind {
     Refines,
     /// Security: this node constrains the target
     Constrains,
+    /// Spec 7 §3.2: this message belongs to the target conversation thread
+    Thread,
     /// Custom semantic relationship (Phase 1 escape hatch)
     Custom(String),
 }

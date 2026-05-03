@@ -510,6 +510,98 @@ impl BridgeFabric {
         f(&guard.inner)
     }
 
+    /// Spec 7 §3.2 — link two nodes by a typed relationship.
+    ///
+    /// `relate(message_id, thread_id, RelationshipKind::Thread, weight)`
+    /// is the call comms uses to attach a message to its thread; other
+    /// kinds reuse the same surface for general edge wiring. The edge is
+    /// directed (`from → to`); typed traversal (see `traverse`) walks the
+    /// graph undirected to recover both ends of a thread conversation.
+    pub fn relate(
+        &self,
+        from: &LineageId,
+        to: &LineageId,
+        kind: crate::context::RelationshipKind,
+        weight: f64,
+    ) -> Result<(), WriteError> {
+        if self.is_terminated() {
+            return Err(WriteError::FabricDegraded);
+        }
+        let mut guard = self.state.write().expect("FabricState poisoned");
+        if guard.terminated_regions.contains(&self.default_namespace) {
+            return Err(WriteError::FabricDegraded);
+        }
+        guard
+            .inner
+            .add_edge(from, to, weight, kind)
+            .map_err(|e| match e {
+                crate::fabric::FabricError::NodeNotFound(id) => WriteError::NodeNotFound(id),
+                other => WriteError::FabricInternal(format!("{:?}", other)),
+            })
+    }
+
+    /// Spec 7 §3.2 — undirected, kind-filtered traversal.
+    ///
+    /// Returns the `LineageId` of every node reachable from `start` via
+    /// edges whose kind appears in `kinds`, up to `max_depth` BFS hops.
+    /// Walks both `from → to` and `to → from` so a thread node reached
+    /// from a message returns the rest of the conversation regardless
+    /// of which direction the original `Thread` edges point. The start
+    /// node itself is NOT included in the result.
+    pub fn traverse(
+        &self,
+        start: &LineageId,
+        kinds: &[crate::context::RelationshipKind],
+        max_depth: usize,
+    ) -> Vec<LineageId> {
+        if max_depth == 0 {
+            return Vec::new();
+        }
+        let guard = self.state.read().expect("FabricState poisoned");
+        let inner = &guard.inner;
+        let mut visited: std::collections::HashSet<LineageId> =
+            std::collections::HashSet::from([start.clone()]);
+        let mut order: Vec<LineageId> = Vec::new();
+        let mut frontier: Vec<LineageId> = vec![start.clone()];
+        for _ in 0..max_depth {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<LineageId> = Vec::new();
+            for cur in &frontier {
+                // forward edges (cur → other)
+                for edge in inner.edges_from(cur) {
+                    if kinds.iter().any(|k| k == &edge.kind)
+                        && !visited.contains(&edge.target)
+                    {
+                        visited.insert(edge.target.clone());
+                        order.push(edge.target.clone());
+                        next.push(edge.target.clone());
+                    }
+                }
+                // reverse edges (other → cur). edges_to returns only
+                // source ids; consult edges_from on each source to
+                // confirm the matching kind.
+                for source in inner.edges_to(cur) {
+                    if visited.contains(source) {
+                        continue;
+                    }
+                    let kind_matches = inner
+                        .edges_from(source)
+                        .iter()
+                        .any(|e| &e.target == cur && kinds.iter().any(|k| k == &e.kind));
+                    if kind_matches {
+                        visited.insert(source.clone());
+                        order.push(source.clone());
+                        next.push(source.clone());
+                    }
+                }
+            }
+            frontier = next;
+        }
+        order
+    }
+
     // ── Debug accessors (Spec 8 §8.5.3) ────────────────────────────
     //
     // These produce structured snapshots that the HTTP `/debug/fabric/*`

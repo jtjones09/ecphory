@@ -14,8 +14,9 @@ use ecphory::comms::{
     Urgency, KIND_COMMS_MESSAGE, KIND_COMMS_THREAD, META_INTENT, META_KIND, META_MENTIONS,
     META_THREAD_STATE, META_THREAD_TOPIC, META_URGENCY,
 };
+use ecphory::context::RelationshipKind;
 use ecphory::identity::NamespaceId;
-use ecphory::{generate_agent_keypair, EditMode};
+use ecphory::{generate_agent_keypair, AgentKeypair, EditMode};
 
 fn comms_bridge() -> Arc<BridgeFabric> {
     Arc::new(BridgeFabric::new().with_default_namespace(NamespaceId::hotash_comms()))
@@ -118,6 +119,160 @@ fn comms_thread_writes_into_hotash_comms_region() {
 
     let identity = bridge.node_identity(&id).expect("identity available");
     assert_eq!(identity.causal_position.namespace, NamespaceId::hotash_comms());
+}
+
+#[test]
+fn thread_with_five_messages_is_recoverable_via_traverse() {
+    // Spec 7 §3.2 / Step 2: messages link to their thread via
+    // `relate(message, thread, RelationshipKind::Thread, …)`. Walking
+    // the thread node along Thread edges (undirected, kind-filtered)
+    // returns every message in the conversation.
+    let bridge = comms_bridge();
+    let starter = generate_agent_keypair();
+    let other = generate_agent_keypair();
+
+    let thread = CommsThread {
+        topic: "rebuild MCP tool list".into(),
+        participants: vec![starter.voice_print(), other.voice_print()],
+        started_by: starter.voice_print(),
+        sensitivity: Sensitivity::Normal,
+        state: ThreadState::Open,
+    };
+    let thread_id = bridge
+        .create(thread.to_intent_node(), EditMode::AppendOnly, Some(&starter))
+        .expect("create thread");
+
+    let mut message_ids = Vec::new();
+    for i in 0..5 {
+        let speaker: &AgentKeypair = if i % 2 == 0 { &starter } else { &other };
+        let msg = CommsMessage {
+            content: MessageContent::Text(format!("message {}", i)),
+            thread: None,
+            mentions: vec![],
+            intent: MessageIntent::Inform,
+            urgency: Urgency::Normal,
+            sensitivity: Sensitivity::Normal,
+        };
+        let id = bridge
+            .create(
+                msg.to_intent_node(speaker.voice_print()),
+                EditMode::AppendOnly,
+                Some(speaker),
+            )
+            .expect("create message");
+        bridge
+            .relate(&id, &thread_id, RelationshipKind::Thread, 1.0)
+            .expect("relate message → thread");
+        message_ids.push(id);
+    }
+
+    let walked = bridge.traverse(&thread_id, &[RelationshipKind::Thread], 10);
+
+    assert_eq!(
+        walked.len(),
+        5,
+        "thread traversal must return all 5 messages, got: {:?}",
+        walked
+    );
+    for id in &message_ids {
+        assert!(
+            walked.contains(id),
+            "message {} missing from thread traversal",
+            id
+        );
+    }
+}
+
+#[test]
+fn traverse_filters_out_other_edge_kinds() {
+    // The kind filter is real — `Thread` traversal must not bleed into
+    // `RelatedTo` edges that happen to touch the same nodes.
+    let bridge = comms_bridge();
+    let agent = generate_agent_keypair();
+
+    let thread = CommsThread {
+        topic: "isolation".into(),
+        participants: vec![agent.voice_print()],
+        started_by: agent.voice_print(),
+        sensitivity: Sensitivity::Normal,
+        state: ThreadState::Open,
+    };
+    let thread_id = bridge
+        .create(thread.to_intent_node(), EditMode::AppendOnly, Some(&agent))
+        .expect("create thread");
+
+    let in_thread = CommsMessage {
+        content: MessageContent::Text("in thread".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+    };
+    let in_thread_id = bridge
+        .create(
+            in_thread.to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .expect("create in-thread message");
+    bridge
+        .relate(&in_thread_id, &thread_id, RelationshipKind::Thread, 1.0)
+        .expect("relate as thread");
+
+    let unrelated = CommsMessage {
+        content: MessageContent::Text("unrelated".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+    };
+    let unrelated_id = bridge
+        .create(
+            unrelated.to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .expect("create unrelated message");
+    bridge
+        .relate(&unrelated_id, &thread_id, RelationshipKind::RelatedTo, 0.5)
+        .expect("relate as RelatedTo");
+
+    let thread_walked = bridge.traverse(&thread_id, &[RelationshipKind::Thread], 10);
+    assert_eq!(thread_walked, vec![in_thread_id.clone()]);
+
+    let related_walked = bridge.traverse(&thread_id, &[RelationshipKind::RelatedTo], 10);
+    assert_eq!(related_walked, vec![unrelated_id]);
+}
+
+#[test]
+fn relate_rejects_unknown_node() {
+    use ecphory::signature::LineageId;
+    let bridge = comms_bridge();
+    let agent = generate_agent_keypair();
+
+    let msg = CommsMessage {
+        content: MessageContent::Text("orphan".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+    };
+    let id = bridge
+        .create(
+            msg.to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+
+    let bogus = LineageId::new();
+    let err = bridge
+        .relate(&id, &bogus, RelationshipKind::Thread, 1.0)
+        .unwrap_err();
+    matches!(err, ecphory::identity::WriteError::NodeNotFound(_));
 }
 
 #[test]
