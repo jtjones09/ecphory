@@ -27,6 +27,7 @@ pub mod temporal;
 pub mod tracer;
 pub mod fabric;
 pub mod bridge;
+pub mod comms;
 pub mod immune;
 pub mod persist;
 pub mod embedding;

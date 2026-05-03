@@ -58,6 +58,19 @@ impl NamespaceId {
             ]),
         )
     }
+
+    /// The Hotash comms region — `hotash:comms` per Spec 7 §2.1.
+    /// Stable across instances; agents subscribe to this UUID to observe
+    /// the inter-agent communication channel.
+    pub fn hotash_comms() -> Self {
+        Self::new(
+            "hotash:comms",
+            Uuid::from_bytes([
+                0xec, 0xc0, 0xcc, 0x07, 0x00, 0x00, 0x40, 0x00,
+                0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+            ]),
+        )
+    }
 }
 
 impl std::fmt::Display for NamespaceId {
