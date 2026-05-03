@@ -24,6 +24,7 @@
 // - Step 10: simplest-viable projection (log file / Slack webhook)
 
 pub mod decision;
+pub mod degraded;
 pub mod handoff;
 pub mod message;
 pub mod observe;
@@ -35,6 +36,11 @@ pub use decision::{
     decision_message, submit_decision_proposal, ConflictDetected, DecisionSubmission,
     DEFAULT_DECISION_CHECKOUT_TTL, KIND_CONFLICT_DETECTED, META_CONFLICT_PROPOSAL_REF,
     META_CONFLICT_PROPOSERS, META_CONFLICT_TARGET,
+};
+pub use degraded::{
+    is_degraded_fallback, replay_degraded_into_comms, submit_or_fallback, CommsHealth,
+    SubmitOutcome, KIND_COMMS_DEGRADED, META_DEGRADED_FLAG, META_DEGRADED_REASON,
+    META_INTENDED_NAMESPACE, META_REPLAYED_AT_NS,
 };
 pub use handoff::{find_lineage_by_fingerprint, CheckOutcome};
 pub use provenance::{

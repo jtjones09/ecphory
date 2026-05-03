@@ -999,6 +999,119 @@ fn operator_intent_companion_only_for_jeremy_authored_messages() {
 }
 
 #[test]
+fn comms_degradation_falls_back_to_operational_region_then_replays_on_recovery() {
+    // Spec 7 §8 / Step 9 (Jeremy J.4 + J.5 fold): comms unhealthy →
+    // agent writes a fallback node into its operational region with
+    // a `comms_degraded` flag. On recovery, replay reconstructs the
+    // comms message into the comms region.
+    use ecphory::comms::{
+        is_degraded_fallback, replay_degraded_into_comms, submit_or_fallback, CommsHealth,
+        KIND_COMMS_DEGRADED, KIND_COMMS_MESSAGE, META_DEGRADED_FLAG, META_INTENDED_NAMESPACE,
+        META_REPLAYED_AT_NS, SubmitOutcome,
+    };
+    use std::collections::HashSet;
+
+    let comms_bridge = comms_bridge();
+    let comms_ns = NamespaceId::hotash_comms();
+    let op_ns = NamespaceId::fresh("hotash:nisaba");
+    let op_bridge = Arc::new(BridgeFabric::new().with_default_namespace(op_ns.clone()));
+
+    let agent = generate_agent_keypair();
+    let msg = CommsMessage {
+        content: MessageContent::Text("the project ledger needs review".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Request,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+        references: vec![],
+    };
+
+    // Comms is unhealthy (e.g., immune system flagged, ImmuneResponseMode=Disabled).
+    let degraded_outcome = submit_or_fallback(
+        &comms_bridge,
+        &comms_ns,
+        &op_bridge,
+        &CommsHealth::Degraded {
+            reason: "ImmuneResponseMode=Disabled".into(),
+        },
+        &msg,
+        &agent,
+    )
+    .expect("fallback write must succeed");
+
+    let op_id = match degraded_outcome {
+        SubmitOutcome::Degraded(id) => id,
+        SubmitOutcome::Comms(_) => panic!("expected fallback to operational region"),
+    };
+
+    let op_node = op_bridge.get_node(&op_id).unwrap();
+    assert!(is_degraded_fallback(&op_node));
+    assert_eq!(
+        op_node
+            .metadata
+            .get("__bridge_node_kind__")
+            .map(|v| v.as_str_repr()),
+        Some(KIND_COMMS_DEGRADED.into())
+    );
+    assert_eq!(
+        op_node
+            .metadata
+            .get(META_INTENDED_NAMESPACE)
+            .map(|v| v.as_str_repr()),
+        Some("hotash:comms".into())
+    );
+
+    // The fallback is in op_ns, NOT the comms region.
+    let op_identity = op_bridge.node_identity(&op_id).unwrap();
+    assert_eq!(op_identity.causal_position.namespace, op_ns);
+
+    // Recovery: comms is healthy again. Replay drains degraded nodes
+    // into the comms region as proper messages.
+    let already: HashSet<ecphory::signature::LineageId> = HashSet::new();
+    let replayed = replay_degraded_into_comms(&comms_bridge, &op_bridge, &agent, &already)
+        .expect("replay must succeed");
+    assert_eq!(replayed.len(), 1, "exactly one degraded node should replay");
+    let (replayed_op_id, replayed_comms_id) = &replayed[0];
+    assert_eq!(replayed_op_id, &op_id);
+
+    // The replayed node lives in the comms region with KIND_COMMS_MESSAGE
+    // and a trail back to the operational original.
+    let comms_node = comms_bridge.get_node(replayed_comms_id).unwrap();
+    assert_eq!(
+        comms_node
+            .metadata
+            .get("__bridge_node_kind__")
+            .map(|v| v.as_str_repr()),
+        Some(KIND_COMMS_MESSAGE.into())
+    );
+    assert!(
+        comms_node.metadata.get(META_DEGRADED_FLAG).is_none(),
+        "replayed comms message must not still claim to be a fallback"
+    );
+    assert_eq!(
+        comms_node
+            .metadata
+            .get(META_REPLAYED_AT_NS)
+            .map(|v| v.as_str_repr()),
+        Some(op_id.as_uuid().to_string())
+    );
+    let comms_identity = comms_bridge.node_identity(replayed_comms_id).unwrap();
+    assert_eq!(comms_identity.causal_position.namespace, comms_ns);
+
+    // Idempotent re-run with `already_replayed` populated → no new
+    // duplicate writes.
+    let mut already = HashSet::new();
+    already.insert(op_id.clone());
+    let replayed_again = replay_degraded_into_comms(&comms_bridge, &op_bridge, &agent, &already)
+        .expect("idempotent replay");
+    assert!(
+        replayed_again.is_empty(),
+        "already-replayed set must prevent duplicate writes"
+    );
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.
