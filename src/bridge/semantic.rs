@@ -389,6 +389,23 @@ impl SemanticStateTable {
         None
     }
 
+    /// Number of currently-Open checkouts on `target`. Spec 7 Step 5
+    /// uses this to detect concurrent decision proposals: when comms
+    /// would open a second checkout on a target that already has one
+    /// Open, it writes a `ConflictDetected` marker to the thread.
+    pub(crate) fn open_checkout_count(&self, target: &LineageId) -> usize {
+        let targets = self.targets.lock().expect("semantic state poisoned");
+        targets
+            .get(target)
+            .map(|ts| {
+                ts.checkouts
+                    .values()
+                    .filter(|c| c.status == CheckoutStatus::Open)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Read-only accessor for tests and operators.
     #[cfg(test)]
     pub(crate) fn snapshot_in_progress(&self, target: &LineageId) -> bool {

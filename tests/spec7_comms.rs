@@ -509,6 +509,163 @@ fn handoff_success_checks_evaluate_against_fabric_state() {
 }
 
 #[test]
+fn concurrent_decision_proposals_emit_conflict_detected_into_thread() {
+    // Spec 7 §4.3 / Step 5: when a second DecisionProposal lands on a
+    // target that already has an Open checkout, the comms layer writes
+    // a `ConflictDetected` marker (informational, not blocking) and
+    // opens its own checkout. Both checkouts can then proceed through
+    // consensus per Spec 8 §3.4.
+    use ecphory::comms::{
+        decision_message, submit_decision_proposal, ConflictDetected, DecisionProposal,
+        KIND_CONFLICT_DETECTED, META_CONFLICT_TARGET,
+    };
+
+    let bridge = comms_bridge();
+    let agent_a = generate_agent_keypair();
+    let agent_b = generate_agent_keypair();
+
+    // Target node: created Semantic so it accepts checkouts.
+    let target_id = bridge
+        .create(
+            ecphory::IntentNode::new("the contested node"),
+            EditMode::Semantic,
+            Some(&agent_a),
+        )
+        .unwrap();
+
+    // Thread to host both proposals.
+    let thread = CommsThread {
+        topic: "should we reword this?".into(),
+        participants: vec![agent_a.voice_print(), agent_b.voice_print()],
+        started_by: agent_a.voice_print(),
+        sensitivity: Sensitivity::Normal,
+        state: ThreadState::Open,
+    };
+    let thread_id = bridge
+        .create(thread.to_intent_node(), EditMode::AppendOnly, Some(&agent_a))
+        .unwrap();
+    let thread_identity = bridge.node_identity(&thread_id).unwrap();
+
+    // Agent A submits the first DecisionProposal.
+    let proposal_a = decision_message(
+        DecisionProposal {
+            proposed_change: "rephrase as 'X'".into(),
+            rationale: "clearer".into(),
+            affected_nodes: vec![target_id.clone()],
+            affected_regions: vec![],
+            affected_agents: vec![],
+        },
+        Some(thread_identity.clone()),
+        MessageIntent::Decide,
+        Urgency::Normal,
+    );
+    let submission_a =
+        submit_decision_proposal(&bridge, &proposal_a, &agent_a).expect("submit A");
+    assert!(
+        submission_a.conflicts.is_empty(),
+        "first proposal must not produce conflicts; got {:?}",
+        submission_a.conflicts
+    );
+    assert_eq!(
+        submission_a.checkouts.len(),
+        1,
+        "first proposal must open exactly one checkout"
+    );
+
+    // Agent B submits a competing DecisionProposal on the same target.
+    let proposal_b = decision_message(
+        DecisionProposal {
+            proposed_change: "rephrase as 'Y'".into(),
+            rationale: "more accurate".into(),
+            affected_nodes: vec![target_id.clone()],
+            affected_regions: vec![],
+            affected_agents: vec![],
+        },
+        Some(thread_identity.clone()),
+        MessageIntent::Decide,
+        Urgency::Normal,
+    );
+    let submission_b =
+        submit_decision_proposal(&bridge, &proposal_b, &agent_b).expect("submit B");
+    assert_eq!(
+        submission_b.conflicts.len(),
+        1,
+        "second proposal must produce one ConflictDetected marker (target had A's open checkout)"
+    );
+    assert_eq!(
+        submission_b.checkouts.len(),
+        1,
+        "second proposal still opens its own checkout — informational, not blocking"
+    );
+
+    // Verify the conflict marker is in the comms region and reachable
+    // from the thread via Thread traversal.
+    let conflict_id = submission_b.conflicts[0].clone();
+    let conflict_node = bridge.get_node(&conflict_id).unwrap();
+    assert_eq!(
+        conflict_node
+            .metadata
+            .get("__bridge_node_kind__")
+            .map(|v| v.as_str_repr()),
+        Some(KIND_CONFLICT_DETECTED.into())
+    );
+    assert_eq!(
+        conflict_node
+            .metadata
+            .get(META_CONFLICT_TARGET)
+            .map(|v| v.as_str_repr()),
+        Some(target_id.as_uuid().to_string())
+    );
+
+    let walked = bridge.traverse(&thread_id, &[RelationshipKind::Thread], 10);
+    assert!(
+        walked.contains(&conflict_id),
+        "ConflictDetected marker must be reachable from the thread via Thread traversal"
+    );
+
+    // Both checkouts can drive through consensus. Agent A finalizes
+    // first; the round stays Open because B hasn't finalized yet.
+    let proposal_a_handle = bridge
+        .propose(
+            &submission_a.checkouts[0].id,
+            ecphory::IntentNode::new("rephrase as 'X'"),
+            &agent_a,
+        )
+        .unwrap();
+    let snap_after_a = bridge
+        .finalize_proposal(&proposal_a_handle.id, &agent_a)
+        .unwrap();
+    assert!(
+        snap_after_a.is_none(),
+        "snapshot must not write yet — B's checkout is still Open"
+    );
+
+    let proposal_b_handle = bridge
+        .propose(
+            &submission_b.checkouts[0].id,
+            ecphory::IntentNode::new("rephrase as 'Y'"),
+            &agent_b,
+        )
+        .unwrap();
+    let snap_after_b = bridge
+        .finalize_proposal(&proposal_b_handle.id, &agent_b)
+        .unwrap();
+    let snapshot = snap_after_b.expect("last finalize must write the consensus snapshot");
+    assert_eq!(snapshot.target, target_id);
+    // Both finalized proposals appear in the snapshot.
+    assert_eq!(snapshot.finalized_proposals.len(), 2);
+    assert!(snapshot.finalized_proposals.contains(&proposal_a_handle.id));
+    assert!(snapshot.finalized_proposals.contains(&proposal_b_handle.id));
+
+    let _ = ConflictDetected {
+        target_node: target_id,
+        proposers: vec![],
+        triggering_message: thread_identity,
+        explanation: "compile-only sanity".into(),
+    };
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.

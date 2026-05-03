@@ -540,6 +540,16 @@ impl BridgeFabric {
             })
     }
 
+    /// Spec 7 §4.3 — number of currently-Open checkouts on `target`.
+    /// Comms uses this to detect concurrent decision proposals: when a
+    /// second `DecisionProposal` for the same target arrives while a
+    /// prior checkout is still Open, the comms layer writes a
+    /// `ConflictDetected` marker to the thread before opening the
+    /// second checkout.
+    pub fn open_checkout_count(&self, target: &LineageId) -> usize {
+        self.semantic_state.open_checkout_count(target)
+    }
+
     /// Spec 7 §3.2 — undirected, kind-filtered traversal.
     ///
     /// Returns the `LineageId` of every node reachable from `start` via
