@@ -24,6 +24,7 @@
 // - Step 10: simplest-viable projection (log file / Slack webhook)
 
 pub mod message;
+pub mod observe;
 pub mod thread;
 
 pub use message::{
@@ -31,6 +32,9 @@ pub use message::{
     Sensitivity, SuccessCheck, Urgency, KIND_COMMS_MESSAGE, META_KIND, META_INTENT,
     META_MENTIONS, META_SENSITIVITY, META_THREAD_FINGERPRINT, META_THREAD_NAMESPACE,
     META_URGENCY,
+};
+pub use observe::{
+    is_comms_message, is_mentioned, message_intent, message_mentions_hex, message_urgency,
 };
 pub use thread::{CommsThread, ThreadState, KIND_COMMS_THREAD, META_THREAD_PARTICIPANTS,
     META_THREAD_STATE, META_THREAD_STARTED_BY, META_THREAD_TOPIC};

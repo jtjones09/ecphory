@@ -276,6 +276,100 @@ fn relate_rejects_unknown_node() {
 }
 
 #[test]
+fn mentioned_agent_subscription_fires_and_subscription_log_records_observation() {
+    // Spec 7 §3 Step 3: Agent B subscribes to comms. Agent A writes a
+    // message mentioning B. B's callback runs (subscription log
+    // increments observation_count). Per Rovelli R.2 fold, B's
+    // subscription matches every CommsMessage — the mentions filter
+    // lives in the callback as prioritization, not in the predicate.
+    use ecphory::bridge::{Callback, CallbackResult, Predicate};
+    use ecphory::comms;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let bridge = comms_bridge();
+    let agent_a = generate_agent_keypair();
+    let agent_b = generate_agent_keypair();
+
+    // B's "directly mentioned" counter increments only when the
+    // callback parses the message and finds B in the mentions list.
+    let mentioned_for_b = Arc::new(AtomicUsize::new(0));
+    let mentioned_clone = Arc::clone(&mentioned_for_b);
+    let b_voice = agent_b.voice_print();
+
+    let pat: Predicate = Arc::new(|node| comms::is_comms_message(node));
+    let cb: Callback = Arc::new(move |node, _ctx| {
+        if comms::is_mentioned(node, &b_voice) {
+            mentioned_clone.fetch_add(1, Ordering::SeqCst);
+        }
+        CallbackResult::Success
+    });
+    let sub_id = bridge.subscribe(pat, cb).expect("subscribe");
+
+    // Agent A writes one mentioning B and one mentioning a third party.
+    let third = generate_agent_keypair();
+    let directed_at_b = CommsMessage {
+        content: MessageContent::Text("hey B, please look at this".into()),
+        thread: None,
+        mentions: vec![agent_b.voice_print()],
+        intent: MessageIntent::Request,
+        urgency: Urgency::Prompt,
+        sensitivity: Sensitivity::Normal,
+    };
+    let directed_at_third = CommsMessage {
+        content: MessageContent::Text("FYI third party".into()),
+        thread: None,
+        mentions: vec![third.voice_print()],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Background,
+        sensitivity: Sensitivity::Normal,
+    };
+    bridge
+        .create(
+            directed_at_b.to_intent_node(agent_a.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent_a),
+        )
+        .unwrap();
+    bridge
+        .create(
+            directed_at_third.to_intent_node(agent_a.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent_a),
+        )
+        .unwrap();
+
+    // Subscription dispatch is async — wait up to 2s for both
+    // observations to settle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let state = bridge.subscription_state(sub_id).expect("sub state");
+        if state.observation_count >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // The subscription log records that B's subscription observed
+    // BOTH messages — every comms subscriber sees every message per
+    // Rovelli R.2.
+    let state = bridge.subscription_state(sub_id).expect("sub state");
+    assert_eq!(
+        state.observation_count, 2,
+        "B's subscription should observe both writes (mentions is a hint, not routing); state={:?}",
+        state
+    );
+
+    // The mentions-filter inside the callback fired exactly once: the
+    // message that named B, not the one that named the third party.
+    assert_eq!(
+        mentioned_for_b.load(Ordering::SeqCst),
+        1,
+        "callback's mentions filter must distinguish B's message from the third party's"
+    );
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.
