@@ -27,6 +27,7 @@ pub mod decision;
 pub mod handoff;
 pub mod message;
 pub mod observe;
+pub mod provenance;
 pub mod thread;
 
 pub use decision::{
@@ -35,6 +36,11 @@ pub use decision::{
     META_CONFLICT_PROPOSERS, META_CONFLICT_TARGET,
 };
 pub use handoff::{find_lineage_by_fingerprint, CheckOutcome};
+pub use provenance::{
+    check_coordination_without_operator, decision_proposals_in_thread,
+    KIND_COORDINATION_WITHOUT_OPERATOR, META_DECISION_COUNT, META_OBSERVATION_KIND,
+    META_OPERATOR_REF, META_THREAD_REF, OBSERVATION_KIND_ANOMALY,
+};
 pub use message::{
     CommsMessage, DecisionProposal, HandoffContext, MessageContent, MessageIntent,
     Sensitivity, SuccessCheck, Urgency, KIND_COMMS_MESSAGE, META_KIND, META_INTENT,

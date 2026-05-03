@@ -666,6 +666,166 @@ fn concurrent_decision_proposals_emit_conflict_detected_into_thread() {
 }
 
 #[test]
+fn coordination_without_operator_observation_when_jeremy_never_subscribes() {
+    // Spec 7 §6.2 / Step 6 (Cohen I.1 FATAL fold): two agents
+    // coordinate a fabric change via comms thread; Jeremy never
+    // subscribes to that thread. The provenance tracer detects this
+    // and produces a CoordinationWithoutOperator AnomalyObservation
+    // (NOT DamageObservation per Matzinger M.1 — governance gap, not
+    // structural harm).
+    use ecphory::comms::{
+        check_coordination_without_operator, decision_message, decision_proposals_in_thread,
+        submit_decision_proposal, DecisionProposal, KIND_COORDINATION_WITHOUT_OPERATOR,
+        META_DECISION_COUNT, META_OBSERVATION_KIND, META_OPERATOR_REF, META_THREAD_REF,
+        OBSERVATION_KIND_ANOMALY,
+    };
+    use std::collections::HashSet;
+
+    let bridge = comms_bridge();
+    let agent_a = generate_agent_keypair();
+    let agent_b = generate_agent_keypair();
+    let jeremy = generate_agent_keypair();
+    // Fabric-internal voice that the immune system signs anomaly
+    // observations with — in production this is the bridge's
+    // immune-aggregation voice.
+    let fabric_voice = bridge.immune_aggregation_voice();
+
+    // Target node coordination affects.
+    let target_id = bridge
+        .create(
+            ecphory::IntentNode::new("target node A and B both touch"),
+            EditMode::Semantic,
+            Some(&agent_a),
+        )
+        .unwrap();
+
+    // Thread A and B coordinate inside.
+    let thread = CommsThread {
+        topic: "should we change the target?".into(),
+        participants: vec![agent_a.voice_print(), agent_b.voice_print()],
+        started_by: agent_a.voice_print(),
+        sensitivity: Sensitivity::Normal,
+        state: ThreadState::Open,
+    };
+    let thread_id = bridge
+        .create(thread.to_intent_node(), EditMode::AppendOnly, Some(&agent_a))
+        .unwrap();
+    let thread_identity = bridge.node_identity(&thread_id).unwrap();
+
+    // A and B each submit a DecisionProposal — coordination happens.
+    let prop_a = decision_message(
+        DecisionProposal {
+            proposed_change: "rephrase".into(),
+            rationale: "clarity".into(),
+            affected_nodes: vec![target_id.clone()],
+            affected_regions: vec![],
+            affected_agents: vec![],
+        },
+        Some(thread_identity.clone()),
+        MessageIntent::Decide,
+        Urgency::Normal,
+    );
+    submit_decision_proposal(&bridge, &prop_a, &agent_a).unwrap();
+
+    let prop_b = decision_message(
+        DecisionProposal {
+            proposed_change: "rephrase differently".into(),
+            rationale: "even clearer".into(),
+            affected_nodes: vec![target_id.clone()],
+            affected_regions: vec![],
+            affected_agents: vec![],
+        },
+        Some(thread_identity.clone()),
+        MessageIntent::Decide,
+        Urgency::Normal,
+    );
+    submit_decision_proposal(&bridge, &prop_b, &agent_b).unwrap();
+
+    // Sanity: the provenance tracer finds both DecisionProposal nodes
+    // in the thread.
+    let decision_ids = decision_proposals_in_thread(&bridge, &thread_id, 32);
+    assert_eq!(
+        decision_ids.len(),
+        2,
+        "both DecisionProposals must be reachable via thread traversal; got {:?}",
+        decision_ids
+    );
+
+    // Jeremy never subscribed to this thread — operator_observed_threads
+    // is empty for him.
+    let jeremy_observed: HashSet<ecphory::signature::LineageId> = HashSet::new();
+    let observation = check_coordination_without_operator(
+        &bridge,
+        &thread_id,
+        &jeremy.voice_print(),
+        &jeremy_observed,
+        fabric_voice.clone(),
+    )
+    .expect("operator never observed → CoordinationWithoutOperator must fire");
+
+    // The observation node carries the AnomalyObservation kind tag (NOT
+    // DamageObservation — Matzinger M.1: governance gap, not structural).
+    assert_eq!(
+        observation
+            .metadata
+            .get(META_OBSERVATION_KIND)
+            .map(|v| v.as_str_repr()),
+        Some(OBSERVATION_KIND_ANOMALY.into())
+    );
+    assert_eq!(
+        observation
+            .metadata
+            .get("__bridge_node_kind__")
+            .map(|v| v.as_str_repr()),
+        Some(KIND_COORDINATION_WITHOUT_OPERATOR.into())
+    );
+    assert_eq!(
+        observation
+            .metadata
+            .get(META_THREAD_REF)
+            .map(|v| v.as_str_repr()),
+        Some(thread_id.as_uuid().to_string())
+    );
+    assert_eq!(
+        observation
+            .metadata
+            .get(META_OPERATOR_REF)
+            .map(|v| v.as_str_repr()),
+        Some(jeremy.voice_print().to_hex())
+    );
+    assert_eq!(
+        observation
+            .metadata
+            .get(META_DECISION_COUNT)
+            .and_then(|v| v.as_f64()),
+        Some(2.0)
+    );
+
+    // The caller commits the observation as a fabric node — for the
+    // test we just confirm the bridge accepts it.
+    let observation_id = bridge
+        .create(observation, EditMode::AppendOnly, None)
+        .expect("commit CoordinationWithoutOperator");
+    assert!(bridge.get_node(&observation_id).is_some());
+
+    // Now repeat with Jeremy's subscription having observed the
+    // thread — no anomaly should fire.
+    let mut jeremy_observed = HashSet::new();
+    jeremy_observed.insert(thread_id.clone());
+    let no_observation = check_coordination_without_operator(
+        &bridge,
+        &thread_id,
+        &jeremy.voice_print(),
+        &jeremy_observed,
+        fabric_voice,
+    );
+    assert!(
+        no_observation.is_none(),
+        "operator subscribed → tracer must not fire"
+    );
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.

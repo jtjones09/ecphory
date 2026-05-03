@@ -143,12 +143,17 @@ pub fn submit_decision_proposal(
         .node_identity(&message_id)
         .expect("just-created message must have identity");
 
-    // Resolve thread LineageId once for conflict-marker linking.
+    // Resolve thread LineageId once for conflict-marker linking and
+    // wire the proposal message into the thread topology so traversal
+    // (and the Step 6 provenance tracer) can find it.
     let thread_lineage = if let Some(thread_id) = &proposal.thread {
         crate::comms::find_lineage_by_fingerprint(bridge, &thread_id.content_fingerprint)
     } else {
         None
     };
+    if let Some(thread_lid) = &thread_lineage {
+        let _ = bridge.relate(&message_id, thread_lid, RelationshipKind::Thread, 1.0);
+    }
 
     let mut conflicts = Vec::new();
     let mut checkouts = Vec::new();
