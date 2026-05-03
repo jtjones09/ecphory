@@ -98,6 +98,7 @@ mod tests {
             intent,
             urgency,
             sensitivity: Sensitivity::Normal,
+            references: vec![],
         }
     }
 

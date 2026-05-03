@@ -28,6 +28,7 @@ pub mod cognitive_map;
 pub mod health;
 pub mod inheritance;
 pub mod multidim;
+pub mod opacity;
 pub mod specialization;
 
 pub use baseline::WelfordTracker;
@@ -53,4 +54,7 @@ pub use cell_agent::{
 pub use specialization::{
     AttestationObserver, ConsensusObserver, DecayObserver, RateObserver, RelationObserver,
     SilenceObserver, Specialization,
+};
+pub use opacity::{
+    OpacityObserver, OperatorObservedSet, DEFAULT_OBSERVATION_WINDOW, DEFAULT_OPACITY_THRESHOLD,
 };

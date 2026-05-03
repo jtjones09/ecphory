@@ -37,6 +37,7 @@ fn comms_message_writes_into_hotash_comms_region_with_full_identity() {
         intent: MessageIntent::Request,
         urgency: Urgency::Normal,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let node = msg.to_intent_node(nisaba.voice_print());
 
@@ -152,6 +153,7 @@ fn thread_with_five_messages_is_recoverable_via_traverse() {
             intent: MessageIntent::Inform,
             urgency: Urgency::Normal,
             sensitivity: Sensitivity::Normal,
+            references: vec![],
         };
         let id = bridge
             .create(
@@ -208,6 +210,7 @@ fn traverse_filters_out_other_edge_kinds() {
         intent: MessageIntent::Inform,
         urgency: Urgency::Normal,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let in_thread_id = bridge
         .create(
@@ -227,6 +230,7 @@ fn traverse_filters_out_other_edge_kinds() {
         intent: MessageIntent::Inform,
         urgency: Urgency::Normal,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let unrelated_id = bridge
         .create(
@@ -259,6 +263,7 @@ fn relate_rejects_unknown_node() {
         intent: MessageIntent::Inform,
         urgency: Urgency::Normal,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let id = bridge
         .create(
@@ -315,6 +320,7 @@ fn mentioned_agent_subscription_fires_and_subscription_log_records_observation()
         intent: MessageIntent::Request,
         urgency: Urgency::Prompt,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let directed_at_third = CommsMessage {
         content: MessageContent::Text("FYI third party".into()),
@@ -323,6 +329,7 @@ fn mentioned_agent_subscription_fires_and_subscription_log_records_observation()
         intent: MessageIntent::Inform,
         urgency: Urgency::Background,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     bridge
         .create(
@@ -402,6 +409,7 @@ fn handoff_success_checks_evaluate_against_fabric_state() {
         intent: MessageIntent::Inform,
         urgency: Urgency::Normal,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let msg_a_id = bridge
         .create(
@@ -421,6 +429,7 @@ fn handoff_success_checks_evaluate_against_fabric_state() {
         intent: MessageIntent::Inform,
         urgency: Urgency::Normal,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     };
     let msg_b_id = bridge
         .create(
@@ -822,6 +831,93 @@ fn coordination_without_operator_observation_when_jeremy_never_subscribes() {
     assert!(
         no_observation.is_none(),
         "operator subscribed → tracer must not fire"
+    );
+}
+
+#[test]
+fn opacity_observer_flags_message_with_five_unobserved_refs() {
+    // Spec 7 §6.1 / Step 7 (Cantrill C.2 + Gershman G.2 fold v1):
+    // OpacityObserver flags messages containing >3 node references
+    // that the operator has not observed in the last 7 days.
+    use ecphory::immune::{CellAgent, ObservationContext, ObservationOutcome, ObservedEvent,
+        OpacityObserver, OperatorObservedSet};
+    use ecphory::signature::LineageId;
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+
+    let bridge = comms_bridge();
+    let agent = generate_agent_keypair();
+    let jeremy = generate_agent_keypair();
+
+    // Five fabric nodes Jeremy hasn't observed.
+    let mut ref_ids: Vec<LineageId> = Vec::new();
+    for i in 0..5 {
+        let node = ecphory::IntentNode::new(format!("referenced node {}", i));
+        let id = bridge
+            .create(node, EditMode::AppendOnly, Some(&agent))
+            .unwrap();
+        ref_ids.push(id);
+    }
+
+    // Operator's observation set is empty — Jeremy has seen nothing.
+    let observed: OperatorObservedSet = Arc::new(RwLock::new(HashSet::new()));
+    let mut opacity = OpacityObserver::new(
+        NamespaceId::hotash_comms(),
+        jeremy.voice_print(),
+        Arc::clone(&observed),
+    );
+
+    // Agent writes a comms message referencing all five.
+    let msg = CommsMessage {
+        content: MessageContent::Text("relevant context".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+        references: ref_ids.clone(),
+    };
+    let msg_id = bridge
+        .create(
+            msg.to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    let msg_node = bridge.get_node(&msg_id).unwrap();
+
+    // Direct dispatch into the OpacityObserver. (The bridge fires
+    // observe() on its own registered cell-agents during create();
+    // here we exercise the observer directly so the assertion is
+    // tight — Spec 6's bridge wiring is exercised separately.)
+    let outcome = opacity.observe(
+        ObservedEvent::Node(&msg_node),
+        &ObservationContext::default(),
+    );
+    match outcome {
+        ObservationOutcome::Anomaly(a) => {
+            assert_eq!(a.specialization, "OpacityObserver");
+            assert_eq!(a.observed_value, 5.0);
+            assert_eq!(a.region, NamespaceId::hotash_comms());
+        }
+        other => panic!("expected anomaly for 5 unobserved refs, got {:?}", other),
+    }
+
+    // Now Jeremy "observes" 3 of them — his observed set covers most
+    // of the references; only 2 remain unobserved → under threshold.
+    {
+        let mut w = observed.write().unwrap();
+        for id in &ref_ids[..3] {
+            w.insert(id.clone());
+        }
+    }
+    let outcome2 = opacity.observe(
+        ObservedEvent::Node(&msg_node),
+        &ObservationContext::default(),
+    );
+    assert!(
+        matches!(outcome2, ObservationOutcome::Quiet),
+        "after operator observes 3 of 5 refs, opacity must drop below threshold"
     );
 }
 

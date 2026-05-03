@@ -8,6 +8,7 @@
 use crate::identity::{NodeIdentity, VoicePrint};
 use crate::node::{IntentNode, MetadataValue};
 use crate::signature::LineageId;
+use uuid::Uuid;
 
 pub const META_KIND: &str = "__bridge_node_kind__";
 pub const KIND_COMMS_MESSAGE: &str = "CommsMessage";
@@ -20,6 +21,7 @@ pub const META_THREAD_FINGERPRINT: &str = "__comms_thread_fingerprint__";
 pub const META_THREAD_NAMESPACE: &str = "__comms_thread_namespace__";
 pub const META_CONTENT_VARIANT: &str = "__comms_content_variant__";
 pub const META_ACK_FINGERPRINT: &str = "__comms_ack_fingerprint__";
+pub const META_REFERENCES: &str = "__comms_references__";
 
 pub const CONTENT_VARIANT_TEXT: &str = "Text";
 pub const CONTENT_VARIANT_STRUCTURED: &str = "Structured";
@@ -43,6 +45,11 @@ pub struct CommsMessage {
     pub urgency: Urgency,
     /// Inherited from thread when set; otherwise `Normal`.
     pub sensitivity: Sensitivity,
+    /// Spec 7 §4.4 / Step 7: explicit fabric-node references the
+    /// message points to (outside the thread / mentions / ack fields).
+    /// The OpacityObserver flags messages with >3 references the
+    /// operator has not observed in the last 7 days.
+    pub references: Vec<LineageId>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,8 +225,35 @@ impl CommsMessage {
             );
         }
 
+        if !self.references.is_empty() {
+            let refs = self
+                .references
+                .iter()
+                .map(|id| id.as_uuid().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            node.metadata
+                .insert(META_REFERENCES.into(), MetadataValue::String(refs));
+        }
+
         node.recompute_signature();
         node
+    }
+
+    /// Parse references back from a materialized comms-message node.
+    /// Returns `Vec` of LineageIds whose UUIDs successfully parsed;
+    /// silently drops malformed entries.
+    pub fn references_from_node(node: &IntentNode) -> Vec<LineageId> {
+        node.metadata
+            .get(META_REFERENCES)
+            .map(|v| {
+                v.as_str_repr()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| Uuid::parse_str(s).ok().map(LineageId::from_uuid))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn render_description(&self) -> String {
@@ -264,6 +298,7 @@ mod tests {
             intent: MessageIntent::Inform,
             urgency: Urgency::Normal,
             sensitivity: Sensitivity::Normal,
+            references: vec![],
         }
     }
 
@@ -320,6 +355,7 @@ mod tests {
                     intent: MessageIntent::Inform,
                     urgency: Urgency::Background,
                     sensitivity: Sensitivity::Normal,
+                    references: vec![],
                 },
                 CONTENT_VARIANT_STRUCTURED,
             ),

@@ -226,6 +226,7 @@ pub fn decision_message(
         intent,
         urgency,
         sensitivity: Sensitivity::Normal,
+        references: vec![],
     }
 }
 
