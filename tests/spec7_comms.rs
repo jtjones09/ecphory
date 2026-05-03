@@ -370,6 +370,145 @@ fn mentioned_agent_subscription_fires_and_subscription_log_records_observation()
 }
 
 #[test]
+fn handoff_success_checks_evaluate_against_fabric_state() {
+    // Spec 7 §4.2 / Step 4: a HandoffContext carries machine-verifiable
+    // SuccessCheck predicates. The delegate runs them against the
+    // fabric and reports pass/fail. This test stages a 4-check handoff
+    // (one per variant) and verifies each evaluates correctly.
+    use ecphory::comms::{CheckOutcome, HandoffContext, SuccessCheck};
+    use ecphory::temporal::FabricInstant;
+    use uuid::Uuid;
+
+    let bridge = comms_bridge();
+    let agent = generate_agent_keypair();
+    let escalation = generate_agent_keypair();
+
+    // Create two messages in the comms region; A → thread; B → thread.
+    let thread = CommsThread {
+        topic: "research handoff".into(),
+        participants: vec![agent.voice_print()],
+        started_by: agent.voice_print(),
+        sensitivity: Sensitivity::Normal,
+        state: ThreadState::Open,
+    };
+    let thread_id = bridge
+        .create(thread.to_intent_node(), EditMode::AppendOnly, Some(&agent))
+        .unwrap();
+
+    let msg_a = CommsMessage {
+        content: MessageContent::Text("audit: findings filed".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+    };
+    let msg_a_id = bridge
+        .create(
+            msg_a.to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+    bridge
+        .relate(&msg_a_id, &thread_id, RelationshipKind::Thread, 1.0)
+        .unwrap();
+
+    let msg_b = CommsMessage {
+        content: MessageContent::Text("status: complete".into()),
+        thread: None,
+        mentions: vec![],
+        intent: MessageIntent::Inform,
+        urgency: Urgency::Normal,
+        sensitivity: Sensitivity::Normal,
+    };
+    let msg_b_id = bridge
+        .create(
+            msg_b.to_intent_node(agent.voice_print()),
+            EditMode::AppendOnly,
+            Some(&agent),
+        )
+        .unwrap();
+
+    // Capture a NodeIdentity for the content-matches and edge-exists
+    // checks via the trait surface.
+    let msg_a_identity = bridge.node_identity(&msg_a_id).unwrap();
+    let msg_b_identity = bridge.node_identity(&msg_b_id).unwrap();
+    let thread_identity = bridge.node_identity(&thread_id).unwrap();
+
+    // Stage a handoff with one passing and one failing check per type.
+    let bogus_uuid = Uuid::new_v4().to_string();
+    let handoff = HandoffContext {
+        task_description: "wrap up research".into(),
+        source_context: vec![msg_a_identity.clone()],
+        constraints: vec!["read-only".into()],
+        success_criteria: vec!["audit log filed".into()],
+        success_checks: vec![
+            SuccessCheck::NodeExists {
+                reference: msg_a_id.as_uuid().to_string(),
+            },
+            SuccessCheck::NodeCountInRegion {
+                region: NamespaceId::hotash_comms(),
+                min: 3, // thread + 2 messages
+            },
+            SuccessCheck::ContentMatches {
+                node: msg_a_identity.clone(),
+                pattern: "audit".into(),
+            },
+            SuccessCheck::EdgeExists {
+                from: msg_a_identity.clone(),
+                to: thread_identity.clone(),
+                edge_type: "Thread".into(),
+            },
+        ],
+        deadline: Some(FabricInstant::now()),
+        escalation_path: escalation.voice_print(),
+    };
+
+    let outcomes = handoff.evaluate_all(&bridge);
+    assert_eq!(outcomes.len(), 4);
+    for (i, o) in outcomes.iter().enumerate() {
+        assert!(o.is_pass(), "check #{} should pass: {:?}", i, o);
+    }
+    assert!(handoff.all_checks_pass(&bridge));
+
+    // Now stage failing checks and confirm they fail with the right
+    // message variant.
+    let failing = HandoffContext {
+        task_description: "should fail".into(),
+        source_context: vec![],
+        constraints: vec![],
+        success_criteria: vec![],
+        success_checks: vec![
+            SuccessCheck::NodeExists {
+                reference: bogus_uuid.clone(),
+            },
+            SuccessCheck::NodeCountInRegion {
+                region: NamespaceId::hotash_comms(),
+                min: 999,
+            },
+            SuccessCheck::ContentMatches {
+                node: msg_b_identity.clone(),
+                pattern: "audit".into(), // msg_b is "status: complete"
+            },
+            SuccessCheck::EdgeExists {
+                from: msg_b_identity.clone(),
+                to: thread_identity.clone(),
+                edge_type: "Thread".into(),
+            },
+        ],
+        deadline: None,
+        escalation_path: escalation.voice_print(),
+    };
+    let failing_outcomes = failing.evaluate_all(&bridge);
+    assert_eq!(failing_outcomes.len(), 4);
+    for o in &failing_outcomes {
+        assert!(matches!(o, CheckOutcome::Fail(_)), "expected Fail: {:?}", o);
+    }
+    assert!(!failing.all_checks_pass(&bridge));
+}
+
+#[test]
 fn comms_namespace_is_stable_across_constructions() {
     // Per Spec 7 §2.1 the comms region UUID must be stable so any agent
     // building a `BridgeFabric` reaches the same region.

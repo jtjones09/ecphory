@@ -23,10 +23,12 @@
 // - Step 9: comms_degraded fallback + replay
 // - Step 10: simplest-viable projection (log file / Slack webhook)
 
+pub mod handoff;
 pub mod message;
 pub mod observe;
 pub mod thread;
 
+pub use handoff::{find_lineage_by_fingerprint, CheckOutcome};
 pub use message::{
     CommsMessage, DecisionProposal, HandoffContext, MessageContent, MessageIntent,
     Sensitivity, SuccessCheck, Urgency, KIND_COMMS_MESSAGE, META_KIND, META_INTENT,
