@@ -51,6 +51,16 @@ pub enum RelationshipKind {
     /// Cross-region by design — evidence lives where the work happens
     /// (nisaba, propmgmt, etc.), the WorkIntent lives in `hotash:work`.
     Fulfills,
+    /// Spec 9 §2.3 K.S2: this child WorkIntent was produced by
+    /// splitting a parent intent. Edge points from child → parent.
+    /// Parent's visibility status becomes `Split` once any child
+    /// links to it.
+    SplitFrom,
+    /// Spec 9 §2.3 K.S2: two WorkIntents whose evidence converged on
+    /// the same problem. Edge is mutual provenance — both originals
+    /// are preserved; neither is primary. Wired in pairs (a → b and
+    /// b → a) by the merge helper.
+    ConvergedWith,
     /// Custom semantic relationship (Phase 1 escape hatch)
     Custom(String),
 }

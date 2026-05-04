@@ -29,11 +29,13 @@
 pub mod claim;
 pub mod gravity;
 pub mod intent;
+pub mod topology;
 pub mod visibility;
 
 pub use claim::WorkClaim;
 pub use gravity::{gravity, AgentProfile, SWITCHING_COST};
 pub use intent::{IntentDuration, WorkIntent};
+pub use topology::{merge_intents, split_intent};
 pub use visibility::{
     query_visibility, IntentSummary, VisibilityConfig, VisibilitySnapshot, WorkStatus,
 };

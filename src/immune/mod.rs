@@ -53,7 +53,7 @@ pub use cell_agent::{
 };
 pub use specialization::{
     AttestationObserver, ConsensusObserver, DecayObserver, RateObserver, RelationObserver,
-    SilenceObserver, Specialization,
+    SilenceObserver, Specialization, WorkObserver,
 };
 pub use opacity::{
     OpacityObserver, OperatorObservedSet, DEFAULT_OBSERVATION_WINDOW, DEFAULT_OPACITY_THRESHOLD,

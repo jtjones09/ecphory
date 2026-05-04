@@ -21,18 +21,21 @@ use std::time::Duration;
 use super::cell_agent::CellAgent;
 use super::specialization::{
     AttestationObserver, ConsensusObserver, DecayObserver, RateObserver, RelationObserver,
-    SilenceObserver, Specialization,
+    SilenceObserver, Specialization, WorkObserver,
 };
 
-/// All six v1 specializations in canonical order. The bootstrap path
-/// + acceptance criterion 5 use this order so manifests are stable.
-pub const V1_SPECIALIZATIONS: [Specialization; 6] = [
+/// All v1 specializations in canonical order. Original v1 minimum was
+/// six; Spec 9 Step 7 added `WorkObserver` so the bootstrap now
+/// provisions seven per region. Manifest order is stable so existing
+/// directories continue to enforce-population correctly.
+pub const V1_SPECIALIZATIONS: [Specialization; 7] = [
     Specialization::Rate,
     Specialization::Attestation,
     Specialization::Decay,
     Specialization::Consensus,
     Specialization::Relation,
     Specialization::Silence,
+    Specialization::Work,
 ];
 
 /// Per-cell-agent manifest written into
@@ -111,6 +114,10 @@ pub fn bootstrap_region(
                 let a = SilenceObserver::new(region.clone(), Duration::from_secs(60));
                 (a.voice_print().to_hex(), a.id().to_string())
             }
+            Specialization::Work => {
+                let a = WorkObserver::new(region.clone(), Duration::from_secs(60));
+                (a.voice_print().to_hex(), a.id().to_string())
+            }
         };
         let manifest = CellAgentManifest {
             region_name: region.name.clone(),
@@ -186,11 +193,11 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_writes_six_manifests_per_region() {
+    fn bootstrap_writes_one_manifest_per_specialization() {
         let root = tmpdir();
         let region = NamespaceId::fresh("propmgmt");
         let report = bootstrap_region(region.clone(), &root).unwrap();
-        assert_eq!(report.manifests.len(), 6);
+        assert_eq!(report.manifests.len(), V1_SPECIALIZATIONS.len());
         for m in &report.manifests {
             let path = root
                 .join(&region.name)

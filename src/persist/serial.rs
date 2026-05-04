@@ -395,6 +395,8 @@ fn relationship_kind_to_string(kind: &RelationshipKind) -> String {
         RelationshipKind::Constrains => "constrains".to_string(),
         RelationshipKind::Thread => "thread".to_string(),
         RelationshipKind::Fulfills => "fulfills".to_string(),
+        RelationshipKind::SplitFrom => "split_from".to_string(),
+        RelationshipKind::ConvergedWith => "converged_with".to_string(),
         RelationshipKind::Custom(s) => format!("custom:{}", s),
     }
 }
@@ -411,6 +413,8 @@ fn string_to_relationship_kind(s: &str) -> Result<RelationshipKind, PersistError
         "constrains" => Ok(RelationshipKind::Constrains),
         "thread" => Ok(RelationshipKind::Thread),
         "fulfills" => Ok(RelationshipKind::Fulfills),
+        "split_from" => Ok(RelationshipKind::SplitFrom),
+        "converged_with" => Ok(RelationshipKind::ConvergedWith),
         s if s.starts_with("custom:") => Ok(RelationshipKind::Custom(s[7..].to_string())),
         other => Err(PersistError::DeserializationError(
             format!("Unknown relationship kind: {}", other)

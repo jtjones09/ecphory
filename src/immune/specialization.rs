@@ -44,6 +44,9 @@ pub enum Specialization {
     Consensus,
     Relation,
     Silence,
+    /// Spec 9 Step 7 / Cohen I.2 — work-region maintenance and
+    /// detection. Provisioned per region alongside the v1 six.
+    Work,
 }
 
 impl Specialization {
@@ -55,6 +58,7 @@ impl Specialization {
             Specialization::Consensus => "ConsensusObserver",
             Specialization::Relation => "RelationObserver",
             Specialization::Silence => "SilenceObserver",
+            Specialization::Work => "WorkObserver",
         }
     }
 }
@@ -874,6 +878,166 @@ impl CellAgent for SilenceObserver {
             baseline_shifted: false,
             baseline_healthy: healthy,
         }
+    }
+}
+
+// ── 3.3.7 WorkObserver — work-region maintenance + lifecycle ──────
+//
+// Spec 9 Step 7 / Cohen I.2. Watches `hotash:work` for WorkIntent and
+// WorkClaim writes. v1 implements the maintenance side (Welford
+// baseline of work-write rate per window, BaselineHealthy emission on
+// retune, ≥80% maintenance ratio per Cohen COHEN.1). The detection
+// side — IntentStalled / IntentOverdue events, emergence legitimacy,
+// resource-competition damage — is staged for v1.5 because it needs
+// fabric-query access (visibility traversal) the `observe()` callback
+// doesn't carry.
+//
+// Identifies work nodes by the `META_KIND` metadata key the work
+// module's materialization helpers stamp (`__work_kind__` =
+// `work_intent` or `work_claim`).
+
+const WORK_META_KIND: &str = "__work_kind__";
+const WORK_KIND_INTENT: &str = "work_intent";
+const WORK_KIND_CLAIM: &str = "work_claim";
+
+pub struct WorkObserver {
+    id: CellAgentId,
+    region: NamespaceId,
+    keypair: AgentKeypair,
+    /// Counts work writes (intents + claims) within the in-flight window.
+    window_count: u64,
+    window_started: std::time::Instant,
+    window_size: Duration,
+    /// Welford baseline of work-writes-per-second.
+    rate_baseline: WelfordTracker,
+    warmup: u64,
+    threshold_sigma: f64,
+}
+
+impl WorkObserver {
+    pub fn new(region: NamespaceId, window_size: Duration) -> Self {
+        Self {
+            id: CellAgentId::new(),
+            region,
+            keypair: generate_agent_keypair(),
+            window_count: 0,
+            window_started: std::time::Instant::now(),
+            window_size,
+            rate_baseline: WelfordTracker::new(),
+            warmup: 5,
+            // Looser than RateObserver's 5σ — work activity is bursty
+            // by nature (intents arrive in clusters; agents claim in
+            // waves). 4σ keeps the false-positive rate manageable
+            // while still catching genuine spikes.
+            threshold_sigma: 4.0,
+        }
+    }
+
+    pub fn warm_baseline(&mut self, samples: &[f64]) {
+        for s in samples {
+            self.rate_baseline.observe(*s);
+        }
+    }
+
+    /// True if the node carries the work-module's kind marker
+    /// (work_intent or work_claim).
+    fn is_work_node(node: &IntentNode) -> bool {
+        match node.metadata.get(WORK_META_KIND) {
+            Some(v) => {
+                let s = v.as_str_repr();
+                s == WORK_KIND_INTENT || s == WORK_KIND_CLAIM
+            }
+            None => false,
+        }
+    }
+}
+
+impl CellAgent for WorkObserver {
+    fn id(&self) -> CellAgentId {
+        self.id.clone()
+    }
+    fn voice_print(&self) -> VoicePrint {
+        self.keypair.voice_print()
+    }
+    fn region(&self) -> &NamespaceId {
+        &self.region
+    }
+    fn specialization(&self) -> &'static str {
+        "WorkObserver"
+    }
+    fn pattern(&self) -> ImmunePattern {
+        ImmunePattern::NodeCreates
+    }
+
+    fn observe(
+        &mut self,
+        event: ObservedEvent<'_>,
+        _ctx: &ObservationContext,
+    ) -> ObservationOutcome {
+        if let ObservedEvent::Node(node) = event {
+            if Self::is_work_node(node) {
+                self.window_count += 1;
+            }
+        }
+
+        if self.window_started.elapsed() < self.window_size {
+            return ObservationOutcome::Quiet;
+        }
+
+        let actual = self.window_started.elapsed().as_secs_f64().max(f64::EPSILON);
+        let rate = self.window_count as f64 / actual;
+        self.window_count = 0;
+        self.window_started = std::time::Instant::now();
+
+        if self.rate_baseline.count() < self.warmup {
+            self.rate_baseline.observe(rate);
+            return ObservationOutcome::Quiet;
+        }
+
+        let z = self.rate_baseline.z_score(rate);
+        if z.abs() >= self.threshold_sigma {
+            ObservationOutcome::Anomaly(anomaly(
+                self.keypair.voice_print(),
+                self.id.clone(),
+                self.region.clone(),
+                "WorkObserver",
+                rate,
+                &self.rate_baseline,
+                z,
+                ObservationSeverity::Medium,
+                (z.abs() / self.threshold_sigma).min(1.0),
+                format!(
+                    "work-write rate {:.3}/s deviates {:.2}σ from baseline {:.3}/s",
+                    rate,
+                    z,
+                    self.rate_baseline.mean()
+                ),
+            ))
+        } else {
+            self.rate_baseline.observe(rate);
+            ObservationOutcome::Quiet
+        }
+    }
+
+    fn retune(&mut self) -> RetuneReport {
+        let healthy = baseline_healthy(
+            self.keypair.voice_print(),
+            self.id.clone(),
+            self.region.clone(),
+            "WorkObserver",
+            &self.rate_baseline,
+        );
+        RetuneReport {
+            baseline_value: self.rate_baseline.mean(),
+            baseline_stddev: self.rate_baseline.stddev(),
+            observation_count: self.rate_baseline.count(),
+            baseline_shifted: false,
+            baseline_healthy: healthy,
+        }
+    }
+
+    fn health(&self) -> CellAgentHealth {
+        CellAgentHealth::Healthy
     }
 }
 
