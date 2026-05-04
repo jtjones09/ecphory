@@ -28,12 +28,17 @@
 
 pub mod claim;
 pub mod gravity;
+pub mod integration;
 pub mod intent;
 pub mod topology;
 pub mod visibility;
 
 pub use claim::WorkClaim;
 pub use gravity::{gravity, AgentProfile, SWITCHING_COST};
+pub use integration::{
+    claim_from_handoff, is_work_degraded_fallback, replay_degraded_into_work,
+    submit_evidence_or_fallback, EvidenceOutcome, WorkHealth,
+};
 pub use intent::{IntentDuration, WorkIntent};
 pub use topology::{merge_intents, split_intent};
 pub use visibility::{
