@@ -22,6 +22,7 @@ extern crate alloc;
 
 pub mod fabric;
 pub mod framebuffer;
+pub mod generative_model;
 pub mod heap;
 pub mod inference;
 pub mod intent;

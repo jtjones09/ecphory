@@ -13,6 +13,7 @@ use crate::framebuffer::{
     BLUE, CHAR_HEIGHT, CHAR_WIDTH, CYAN, Color, DIM, FrameBufferWriter, GREEN, LETTER_SPACING,
     LINE_SPACING, RED, WHITE, YELLOW,
 };
+use crate::generative_model::MODEL;
 
 const BORDER: usize = 12;
 const PANE_GAP: usize = 24;
@@ -122,12 +123,52 @@ pub fn render(fb: &mut FrameBufferWriter, fabric: &Fabric, tess: &Tesseract) {
     render_log(fb, &tess.log, right_x, pane_top, right_w, pane_h);
     render_prompt(fb, &tess.current_input, fabric, BORDER, pane_bottom + 8);
 
+    // Bottom of left pane: storage-agent line plus generative-model
+    // overview (boots, observations, average free energy, region
+    // map-states). The model overview comes from the global MODEL
+    // singleton and is what makes the Tesseract a window onto the
+    // *model's mind* rather than just a hardware inventory.
+    let agent_y = pane_top + (pane_h * 3) / 4;
+    fb.draw_text(left_x, agent_y, "GENERATIVE MODEL", BLUE);
+    let mut row = agent_y + HEADER_HEIGHT + 4;
+    fb.draw_hline(left_x, row, left_w, Color(40, 50, 70));
+    row += LINE_SPACING + 4;
+
+    let (overview, meta_summary, causal_summary) = {
+        let slot = MODEL.lock();
+        match slot.as_ref() {
+            Some(model) => {
+                let overview = model.render_overview();
+                let meta = model.meta.render_summary();
+                let causal = format!(
+                    "causal: {} nodes, {} edges",
+                    model.causal_graph.node_count(),
+                    model.causal_graph.edge_count()
+                );
+                (overview, meta, causal)
+            }
+            None => (
+                "model: not yet nucleated".to_string(),
+                "meta: pre-assessment".to_string(),
+                "causal: 0 nodes, 0 edges".to_string(),
+            ),
+        }
+    };
+
+    for line in FrameBufferWriter::wrap_lines(&overview, left_w) {
+        fb.draw_text(left_x, row, line, CYAN);
+        row += LINE_STEP;
+    }
+    for line in FrameBufferWriter::wrap_lines(&meta_summary, left_w) {
+        fb.draw_text(left_x, row, line, GREEN);
+        row += LINE_STEP;
+    }
+    for line in FrameBufferWriter::wrap_lines(&causal_summary, left_w) {
+        fb.draw_text(left_x, row, line, WHITE);
+        row += LINE_STEP;
+    }
+
     if !tess.storage_agent_summary.is_empty() {
-        let agent_y = pane_top + (pane_h * 3) / 4;
-        fb.draw_text(left_x, agent_y, "STORAGE AGENT", BLUE);
-        let mut row = agent_y + HEADER_HEIGHT + 4;
-        fb.draw_hline(left_x, row, left_w, Color(40, 50, 70));
-        row += LINE_SPACING + 4;
         for line in FrameBufferWriter::wrap_lines(&tess.storage_agent_summary, left_w) {
             fb.draw_text(left_x, row, line, GREEN);
             row += LINE_STEP;
