@@ -2,3 +2,11 @@
 Cargo.lock
 **/*.rs.bk
 .DS_Store
+
+# Nucleation branch — kernel build artifacts.
+# Disk images are produced by runner-*/build.rs into target/, but stray
+# copies (e.g. ad-hoc dist/ dirs) and storage images written next to the
+# runners during smoke tests should never enter git.
+dist/
+*.img
+*.ppm

@@ -1,0 +1,11 @@
+[package]
+name = "kernel-uefi-common"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jeremy Jones"]
+description = "Shared UEFI helpers for both x86_64 and aarch64 ecphory kernels — framebuffer/Blt, BlockIO storage picker, Simple Text Input, ACPI RSDP, memory map."
+
+[dependencies]
+kernel-core = { path = "../kernel-core" }
+uefi = { version = "0.37", features = ["alloc"] }
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }

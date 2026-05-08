@@ -1,0 +1,15 @@
+[package]
+name = "runner-aarch64"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jeremy Jones"]
+description = "Build and run the aarch64 ecphory image in qemu-system-aarch64"
+
+[dependencies]
+
+[build-dependencies]
+kernel-aarch64 = { path = "../kernel-aarch64", artifact = "bin", target = "aarch64-unknown-uefi" }
+
+[[bin]]
+name = "runner-aarch64"
+path = "src/main.rs"
