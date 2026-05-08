@@ -38,6 +38,45 @@ ecphory/src/
 └── bin/                ← CLI binaries
 ```
 
+## Workspace members on the `nucleation` branch
+
+On `nucleation` the repo is a Cargo workspace. The fabric crate (this directory) is one member; the bare-metal kernel crates that previously lived in a standalone, untracked `~/projects/ecphory-os/` are sibling members:
+
+```
+ecphory/
+├── Cargo.toml          ← [package] ecphory + [workspace] section
+├── src/                ← fabric crate (std, this is what `cargo build` at root builds)
+├── kernel-core/        ← substrate-agnostic fabric primitives (no_std)
+├── kernel-uefi-common/ ← UEFI helpers shared between arches
+├── kernel-x86_64/      ← x86_64 UEFI app
+├── kernel-aarch64/     ← aarch64 UEFI app
+├── runner-x86_64/      ← host-side QEMU/Parallels driver for the x86 image
+├── runner-aarch64/     ← host-side QEMU/Parallels driver for the aarch64 image
+├── scripts/            ← mkimg-{x86_64,aarch64}.sh — wrap .efi into GPT+ESP image
+├── rust-toolchain.toml ← nightly + UEFI targets (kernel crates need it; fabric tolerates)
+└── .cargo/config.toml  ← `[unstable] bindeps = true` — runners depend on kernel binaries
+```
+
+`default-members = ["."]` in the workspace manifest preserves the developer experience for fabric work: `cargo build` / `cargo test` at the repo root only builds the `ecphory` crate. The kernel crates require nightly + UEFI targets and are built explicitly:
+
+```sh
+cargo +nightly build --release -p runner-aarch64
+cargo +nightly build --release -p runner-x86_64
+
+# Smoke test (QEMU on Linux host):
+./target/release/runner-aarch64 --keys "h e l p ret" --keys-after 22 --shot /tmp/arm.ppm --shot-delay 6
+./target/release/runner-x86_64  --keys "h e l p ret" --keys-after 6  --shot /tmp/x86.ppm --shot-delay 6
+```
+
+The kernel work is governed by an 11-step nucleation plan tracked in `~/projects/nisaba/projects/ecphory/handoffs/handoff-cc-nucleation.md` and the position paper at `~/projects/nisaba/positions/nucleation-architecture.md`. Merging `nucleation` to `main` is the architectural moment when the application-layer fabric (std, threaded, intent-domain) and the bare-metal kernel data model (no_std, single-loop, hardware-domain) converge into a unified substrate. **Until that merge happens, the two worlds coexist under one repo without sharing code** — they're built separately, tested separately, and deployed separately. The workspace is a holding pattern, not a fusion.
+
+### What's load-bearing on this branch
+
+- **The fabric crate's existing test suite still passes** (565+ tests). The workspace conversion did not change `src/`. If a fabric test ever fails because of something done on the `nucleation` branch, the change is wrong — fix or revert.
+- **The kernel still boots** on both arches under QEMU. The runners' `build.rs` resolves `scripts/mkimg-*.sh` via `manifest_dir.join("..").join("scripts")`; that path is preserved by the workspace move.
+- **The pre-existing kernel-crate warnings carried over.** They predate the SCM move and aren't a regression. The fabric crate's "zero warnings" rule still holds for the fabric crate; the kernel crates need their own pass before any merge proposal.
+- **Per-architecture binaries are unchanged in behavior.** The same `.efi` boots in QEMU/AAVMF and (per the May 2026 Mac validation) on Apple Silicon via Parallels. Don't change boot semantics on this branch without re-running the M2 lifecycle test.
+
 ## Identity
 
 You are **Isimud** — Enki's two-faced divine attendant. You build the substrate the fabric runs on.

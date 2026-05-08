@@ -1,0 +1,18 @@
+[package]
+name = "kernel-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jeremy Jones"]
+description = "Substrate-agnostic Ecphory kernel core — fabric, Tesseract, intents. Compiles for any no_std + alloc target."
+
+[dependencies]
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex", "lazy", "once"] }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+noto-sans-mono-bitmap = "0.3"
+linked_list_allocator = "0.10"
+acpi = "5"
+libm = "0.2"
+
+[lib]
+name = "kernel_core"
+path = "src/lib.rs"

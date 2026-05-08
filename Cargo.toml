@@ -55,3 +55,34 @@ path = "src/bin/intent.rs"
 [[bin]]
 name = "immune-bootstrap"
 path = "src/bin/immune-bootstrap.rs"
+
+# ---------- Workspace (nucleation branch only) ----------
+#
+# On the `nucleation` branch the bare-metal kernel crates live here as
+# workspace members alongside the fabric crate. `default-members = ["."]`
+# keeps `cargo build` / `cargo test` at the repo root building only the
+# existing ecphory crate — the kernel crates require nightly + UEFI
+# targets and are built explicitly:
+#
+#     cargo +nightly build --release -p runner-aarch64
+#     cargo +nightly build --release -p runner-x86_64
+#
+# Merging this branch to `main` is the architectural moment when the
+# application-layer fabric and the bare-metal kernel data models
+# converge. Until then they coexist under one repo without sharing
+# code (no_std vs std, single-loop vs threaded). See
+# nisaba/positions/nucleation-architecture.md for the full vision and
+# nisaba/projects/ecphory/handoffs/handoff-cc-nucleation.md for the
+# 11-step plan currently in flight.
+[workspace]
+members = [
+    ".",
+    "kernel-core",
+    "kernel-uefi-common",
+    "kernel-x86_64",
+    "kernel-aarch64",
+    "runner-x86_64",
+    "runner-aarch64",
+]
+default-members = ["."]
+resolver = "2"

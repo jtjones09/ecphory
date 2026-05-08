@@ -1,0 +1,18 @@
+[package]
+name = "kernel-aarch64"
+version = "0.1.0"
+edition = "2021"
+authors = ["Jeremy Jones"]
+description = "Ecphory bare-metal kernel — aarch64 binary (UEFI app)"
+
+[dependencies]
+kernel-core = { path = "../kernel-core" }
+kernel-uefi-common = { path = "../kernel-uefi-common" }
+uefi = { version = "0.37", features = ["alloc", "panic_handler"] }
+spin = { version = "0.10", default-features = false, features = ["mutex", "spin_mutex"] }
+
+[[bin]]
+name = "kernel-aarch64"
+path = "src/main.rs"
+test = false
+bench = false
