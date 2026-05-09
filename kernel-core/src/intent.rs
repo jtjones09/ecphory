@@ -107,6 +107,7 @@ fn handle(fabric: &Fabric, line: &str) -> String {
         "causal" | "graph" => command_causal(),
         "surprise" | "surp" => command_surprise(),
         "model" | "mind" => command_model(),
+        "disks" | "blockio" => command_disks(),
         _ => format!("unknown intent: {} (try `help`)", trimmed),
     }
 }
@@ -360,8 +361,22 @@ fn command_work(f: &Fabric) -> String {
 }
 
 fn command_help() -> String {
-    "commands: status health work agents fabric memory pci acpi features intents uptime persist clear causal surprise model help"
+    "commands: status health work agents fabric memory pci acpi features intents uptime persist clear causal surprise model disks help"
         .to_string()
+}
+
+fn command_disks() -> String {
+    let inv = crate::storage_inventory::snapshot();
+    if inv.is_empty() {
+        return "disks: no BlockIO inventory recorded (substrate did not enumerate)".to_string();
+    }
+    let total = inv.len();
+    let picked = inv.iter().filter(|d| d.picked_for_storage).count();
+    let mut s = format!("disks: {} BlockIO devices (picked: {}):", total, picked);
+    for d in inv {
+        s.push_str(&format!("\n  {}", d.render_summary()));
+    }
+    s
 }
 
 fn command_memory(f: &Fabric) -> String {

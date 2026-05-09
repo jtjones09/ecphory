@@ -37,6 +37,7 @@ use uefi::table::cfg::ConfigTableEntry;
 
 use kernel_core::framebuffer::{FbInfo, FrameBufferWriter, PixelFormat};
 use kernel_core::ops::{BlockResult, Op, OpResult};
+use kernel_core::storage_inventory::{self, BlockDeviceInfo};
 use kernel_core::{MemoryKind, MemoryRegion};
 
 // ---------- substrate-wide singletons ----------
@@ -138,24 +139,24 @@ pub fn init() -> UefiSubstrate {
             .ok()
             .map(|dp| device_path_bytes(&dp))
     });
+    let mut inventory: Vec<BlockDeviceInfo> = Vec::new();
     if let Ok(handles) =
         uefi::boot::locate_handle_buffer(SearchType::from_proto::<BlockIO>())
     {
-        let mut best: Option<(usize, u64, u64)> = None; // (idx, last_block, block_size)
+        // First pass — collect inventory of every BlockIO with its
+        // boot/ancestor/partition flags. The kernel renders this list
+        // through the `disks` command so the operator can see every
+        // device the picker considered before any write happens.
         for (i, handle) in handles.iter().enumerate() {
-            // Skip the boot device handle itself.
-            if Some(*handle) == boot_device_handle {
-                continue;
-            }
-            // Skip ancestors of the boot device (e.g. the underlying
-            // physical disk that contains the boot ESP partition).
+            let is_boot_device = Some(*handle) == boot_device_handle;
+            let mut is_boot_ancestor = false;
             if let Some(boot_bytes) = boot_path_bytes.as_ref() {
                 if let Ok(cand_dp) =
                     uefi::boot::open_protocol_exclusive::<DevicePath>(*handle)
                 {
                     let cand_bytes = device_path_bytes(&cand_dp);
                     if is_strict_prefix(&cand_bytes, boot_bytes) {
-                        continue;
+                        is_boot_ancestor = true;
                     }
                 }
             }
@@ -163,42 +164,64 @@ pub fn init() -> UefiSubstrate {
                 continue;
             };
             let media = bio.media();
-            if media.is_logical_partition() {
-                continue;
-            }
+            let is_logical_partition = media.is_logical_partition();
             let last_block = media.last_block();
             let block_size = media.block_size() as u64;
-            if block_size == 0 || last_block == 0 {
+            let blocks = if last_block == 0 { 0 } else { last_block + 1 };
+            inventory.push(BlockDeviceInfo {
+                index: i,
+                label: device_label(blocks, block_size, is_logical_partition),
+                blocks,
+                block_size,
+                is_logical_partition,
+                is_boot_device,
+                is_boot_ancestor,
+                picked_for_storage: false,
+            });
+        }
+
+        // Second pass — pick the largest non-boot, non-ancestor, non-
+        // partition device. Same selection rule as before; the inventory
+        // pass above is purely additive.
+        let mut best: Option<(usize, u64, u64)> = None;
+        for (i, dev) in inventory.iter().enumerate() {
+            if dev.is_boot_device
+                || dev.is_boot_ancestor
+                || dev.is_logical_partition
+                || dev.block_size == 0
+                || dev.blocks == 0
+            {
                 continue;
             }
+            let total = dev.blocks.saturating_mul(dev.block_size);
             let take = match best {
                 None => true,
-                Some((_, prev_last, prev_bs)) => {
-                    last_block * block_size > prev_last * prev_bs
-                }
+                Some((_, prev_total, _)) => total > prev_total,
             };
             if take {
-                best = Some((i, last_block, block_size));
+                best = Some((i, total, dev.block_size));
             }
         }
-        if let Some((idx, last_block, block_size)) = best {
-            // Re-open the chosen handle and stash the protocol pointer.
+        if let Some((inv_idx, total, _)) = best {
+            let handle_idx = inventory[inv_idx].index;
             if let Ok(mut bio) =
-                uefi::boot::open_protocol_exclusive::<BlockIO>(handles[idx])
+                uefi::boot::open_protocol_exclusive::<BlockIO>(handles[handle_idx])
             {
                 let raw: *mut BlockIO = (&mut *bio) as *mut BlockIO;
                 BLOCKIO_PTR.store(raw, Ordering::Release);
                 core::mem::forget(bio);
                 storage_present = true;
-                storage_blocks = last_block + 1;
-                storage_block_size = block_size;
-                let total_mib = (storage_blocks * storage_block_size) / (1024 * 1024);
+                storage_blocks = inventory[inv_idx].blocks;
+                storage_block_size = inventory[inv_idx].block_size;
+                let total_mib = total / (1024 * 1024);
                 storage_label = format!("UEFI BlockIO ({} MiB)", total_mib);
                 STORAGE_BLOCK_SIZE.store(storage_block_size, Ordering::Release);
                 STORAGE_TOTAL_BLOCKS.store(storage_blocks, Ordering::Release);
+                inventory[inv_idx].picked_for_storage = true;
             }
         }
     }
+    storage_inventory::record(inventory);
 
     UefiSubstrate {
         fb_info,
@@ -238,6 +261,16 @@ fn device_path_bytes(dp: &DevicePath) -> Vec<u8> {
 /// `prefix` is a strict (non-equal) prefix of `full`.
 fn is_strict_prefix(prefix: &[u8], full: &[u8]) -> bool {
     prefix.len() < full.len() && full.starts_with(prefix)
+}
+
+fn device_label(blocks: u64, block_size: u64, is_partition: bool) -> String {
+    let total = blocks.saturating_mul(block_size);
+    let mib = total / (1024 * 1024);
+    if is_partition {
+        format!("partition ({} MiB)", mib)
+    } else {
+        format!("disk ({} MiB)", mib)
+    }
 }
 
 fn pick_largest_mode(gop: &mut ScopedProtocol<GraphicsOutput>) -> Option<()> {

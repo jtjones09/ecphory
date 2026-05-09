@@ -32,6 +32,7 @@ pub mod observe;
 pub mod ops;
 pub mod snapshot;
 pub mod storage_agent;
+pub mod storage_inventory;
 pub mod tesseract;
 
 /// Pre-Step-2 compatibility alias. Pre-nucleation code referenced

@@ -28,6 +28,29 @@ use kernel_core::observe::{GenesisInput, genesis};
 use kernel_core::ops::{Op, OpResult, Shim};
 use kernel_core::tesseract::TESSERACT;
 
+/// Build-time persist toggle. The kernel reads/writes LBA 0/1 of the
+/// picked BlockIO device for snapshot persistence by default. Building
+/// with `ECPHORY_PERSIST=0` produces an observe-only image — the
+/// kernel still enumerates every BlockIO device and surfaces them via
+/// the `disks` command, but never reads or writes any of them. Used
+/// for first-boot exploration of a real machine where we don't yet
+/// know what's on the storage device.
+const PERSIST_ENABLED: bool = parse_persist_env(option_env!("ECPHORY_PERSIST"));
+
+const fn parse_persist_env(value: Option<&'static str>) -> bool {
+    match value {
+        None => true,
+        Some(s) => {
+            // Only "0" turns persistence off. Any other value (including
+            // unset, "1", or stray whitespace) keeps the default-on
+            // behavior so a typo doesn't silently produce an observe-
+            // only build for someone who wanted normal persistence.
+            let bytes = s.as_bytes();
+            !(bytes.len() == 1 && bytes[0] == b'0')
+        }
+    }
+}
+
 #[entry]
 fn efi_main() -> Status {
     let sub = kernel_uefi_common::init();
@@ -52,10 +75,14 @@ fn efi_main() -> Status {
         t.dirty = true;
     }
 
-    // Try to restore prior fabric snapshot via the shim.
+    // Try to restore prior fabric snapshot via the shim. In observe-
+    // only builds (built with `ECPHORY_PERSIST=0`), the snapshot path
+    // is gated off entirely — the kernel never reads or writes LBA
+    // 0/1 of the picked device. Used for first-boot exploration of an
+    // unfamiliar machine.
     let mut shim = X86Shim;
     let mut restored = false;
-    if sub.storage_present {
+    if PERSIST_ENABLED && sub.storage_present {
         match kernel_core::snapshot::restore(&mut shim) {
             Ok(snap) => {
                 let lamport = snap.lamport;
@@ -76,6 +103,9 @@ fn efi_main() -> Status {
                 t.log_system(format!("no prior snapshot ({}); fresh genesis", e));
             }
         }
+    } else if !PERSIST_ENABLED {
+        let mut t = TESSERACT.lock();
+        t.log_system("observe-only build: snapshot read/write disabled");
     }
 
     if !restored {
@@ -118,7 +148,7 @@ fn efi_main() -> Status {
         }
     }
 
-    if sub.storage_present {
+    if PERSIST_ENABLED && sub.storage_present {
         let f = FABRIC.lock();
         match kernel_core::snapshot::persist(&f, &mut shim) {
             Ok(bytes) => {
@@ -141,10 +171,17 @@ fn efi_main() -> Status {
         t.log_system("type help to list intents");
     }
 
+    let persist_enabled = PERSIST_ENABLED && sub.storage_present;
+    // In observe-only builds we also disable the agent step. The agent's
+    // ACT_WRITE replays a read block back as a write, which is byte-
+    // identical but still issues a write IO to the picked device — not
+    // safe on hardware whose state we're trying to inspect non-
+    // destructively.
+    let agent_enabled = PERSIST_ENABLED && sub.storage_present;
     let cfg = LoopConfig {
         agent_label: String::from("vblk0"),
-        agent_enabled: sub.storage_present,
-        persist_enabled: sub.storage_present,
+        agent_enabled,
+        persist_enabled,
     };
     kernel_core::inference::run(&mut shim, &kernel_uefi_common::FB, cfg)
 }
