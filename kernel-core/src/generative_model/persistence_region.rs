@@ -77,6 +77,15 @@ pub struct PersistenceRegion {
     pub failed_persists: u64,
     pub successful_restores: u64,
     pub failed_restores: u64,
+    /// Persist gate: when the model has accumulated more than this much
+    /// surprise since the last successful persist, the inference loop
+    /// triggers a snapshot. Replaces the old hardcoded
+    /// `PERSIST_EVERY_LAMPORT` cadence with a model-resident parameter
+    /// the agent can later learn to tune. Default 5.0; lower → persist
+    /// more often, higher → persist less often. Operator-typed
+    /// `> persist` bumps the accumulator above any reasonable threshold
+    /// so the next cycle persists regardless.
+    pub persist_threshold: f32,
 }
 
 impl PersistenceRegion {
@@ -98,7 +107,16 @@ impl PersistenceRegion {
             failed_persists: 0,
             successful_restores: 0,
             failed_restores: 0,
+            persist_threshold: 5.0,
         }
+    }
+
+    /// The persist gate: triggers when the model has accumulated more
+    /// surprise since the last save than `persist_threshold` allows.
+    /// Caller is the inference loop; it passes
+    /// `model.cumulative_surprise_since_last_persist` as `info_at_risk`.
+    pub fn should_persist_now(&self, info_at_risk: f32) -> bool {
+        info_at_risk > self.persist_threshold
     }
 
     /// The action the agent prefers right now, given current beliefs.

@@ -13,9 +13,6 @@ use crate::generative_model::{operator_region, MODEL};
 use crate::tesseract::TESSERACT;
 use core::sync::atomic::Ordering;
 
-use core::sync::atomic::AtomicBool;
-pub static PERSIST_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone, Debug)]
 pub struct Exchange {
     pub intent: NodeId,
@@ -252,7 +249,15 @@ fn command_fabric(f: &Fabric) -> String {
 }
 
 fn command_persist() -> String {
-    PERSIST_REQUESTED.store(true, Ordering::Release);
+    // Bump the unsaved-information accumulator above any reasonable
+    // threshold so the next inference cycle's `should_persist_now`
+    // returns true. The model decides whether to persist; we just push
+    // its parameter. Replaces the old AtomicBool flag with a model-
+    // resident, learnable mechanism.
+    let mut slot = MODEL.lock();
+    if let Some(m) = slot.as_mut() {
+        m.cumulative_surprise_since_last_persist += 100.0;
+    }
     "persist requested — snapshot will be written this cycle".to_string()
 }
 

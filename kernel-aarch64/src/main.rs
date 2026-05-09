@@ -21,6 +21,7 @@ use uefi::Status;
 use uefi::prelude::*;
 
 use kernel_core::FABRIC;
+use kernel_core::generative_model::{submit_event, LogCandidate};
 use kernel_core::inference::LoopConfig;
 use kernel_core::observe::{GenesisInput, genesis};
 use kernel_core::ops::{Op, OpResult, Shim};
@@ -31,25 +32,24 @@ use kernel_core::{CpuObservation, PciObservation};
 fn efi_main() -> Status {
     let sub = kernel_uefi_common::init();
 
-    {
-        let mut t = TESSERACT.lock();
-        t.log_system("aarch64: kernel-aarch64 entry");
-        if let Some(info) = sub.fb_info {
-            t.log_system(format!(
-                "gop: {}x{} format={:?}",
-                info.width, info.height, info.pixel_format
-            ));
-        }
-        if sub.storage_present {
-            t.log_system(format!(
-                "storage: {} ({} blocks x {} B)",
-                sub.storage_label, sub.storage_blocks, sub.storage_block_size
-            ));
-        } else {
-            t.log_system("storage: none discovered (persistence disabled)");
-        }
-        t.dirty = true;
+    submit_event(LogCandidate::Boot("aarch64: kernel-aarch64 entry".into()));
+    if let Some(info) = sub.fb_info {
+        submit_event(LogCandidate::DeviceDiscovery(format!(
+            "gop: {}x{} format={:?}",
+            info.width, info.height, info.pixel_format
+        )));
     }
+    if sub.storage_present {
+        submit_event(LogCandidate::DeviceDiscovery(format!(
+            "storage: {} ({} blocks x {} B)",
+            sub.storage_label, sub.storage_blocks, sub.storage_block_size
+        )));
+    } else {
+        submit_event(LogCandidate::DeviceDiscovery(
+            "storage: none discovered (persistence disabled)".into(),
+        ));
+    }
+    TESSERACT.lock().dirty = true;
 
     let mut shim = ArmShim;
     let mut restored = false;
@@ -59,19 +59,22 @@ fn efi_main() -> Status {
                 let lamport = snap.lamport;
                 let nodes = snap.nodes.len();
                 let edges = snap.edges.len();
-                let mut f = FABRIC.lock();
-                kernel_core::snapshot::apply(&mut f, snap);
-                drop(f);
-                let mut t = TESSERACT.lock();
-                t.log_system(format!(
-                    "restored {} nodes / {} edges from disk (lamport {})",
-                    nodes, edges, lamport
-                ));
+                {
+                    let mut f = FABRIC.lock();
+                    kernel_core::snapshot::apply(&mut f, snap);
+                }
+                submit_event(LogCandidate::RestoreOk {
+                    nodes,
+                    edges,
+                    lamport,
+                });
                 restored = true;
             }
             Err(e) => {
-                let mut t = TESSERACT.lock();
-                t.log_system(format!("no prior snapshot ({}); fresh genesis", e));
+                submit_event(LogCandidate::NoSnapshot(format!(
+                    "no prior snapshot ({}); fresh genesis",
+                    e
+                )));
             }
         }
     }
@@ -82,15 +85,12 @@ fn efi_main() -> Status {
         let memory = kernel_uefi_common::observe_memory();
         let rsdp = kernel_uefi_common::find_rsdp();
 
-        {
-            let mut t = TESSERACT.lock();
-            t.log_system(format!(
-                "observed: cpu={} mem-regions={} rsdp={}",
-                cpu.vendor,
-                memory.len(),
-                rsdp.map(|_| "yes").unwrap_or("none"),
-            ));
-        }
+        submit_event(LogCandidate::Genesis(format!(
+            "observed: cpu={} mem-regions={} rsdp={}",
+            cpu.vendor,
+            memory.len(),
+            rsdp.map(|_| "yes").unwrap_or("none"),
+        )));
 
         {
             let mut f = FABRIC.lock();
@@ -116,27 +116,20 @@ fn efi_main() -> Status {
     }
 
     if sub.storage_present {
-        let f = FABRIC.lock();
-        match kernel_core::snapshot::persist(&f, &mut shim) {
-            Ok(bytes) => {
-                drop(f);
-                TESSERACT
-                    .lock()
-                    .log_system(format!("persisted {} bytes to disk", bytes));
-            }
-            Err(e) => {
-                drop(f);
-                TESSERACT
-                    .lock()
-                    .log_warning(format!("persist failed: {}", e));
-            }
-        }
+        let result = {
+            let f = FABRIC.lock();
+            kernel_core::snapshot::persist(&f, &mut shim)
+        };
+        submit_event(LogCandidate::PersistOutcome {
+            ok: result.is_ok(),
+            bytes: result.as_ref().copied().unwrap_or(0),
+            error: result.as_ref().err().map(|e| format!("{}", e)),
+        });
     }
 
-    {
-        let mut t = TESSERACT.lock();
-        t.log_system("type help to list intents");
-    }
+    submit_event(LogCandidate::DeviceDiscovery(
+        "type help to list intents".into(),
+    ));
 
     let cfg = LoopConfig {
         agent_label: String::from("vblk0"),

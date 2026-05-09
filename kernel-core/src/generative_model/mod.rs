@@ -19,7 +19,11 @@ pub mod pattern_engine;
 pub mod persistence_region;
 pub mod preferences;
 
+use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
+
+use crate::tesseract::{LogKind, TESSERACT};
 
 pub use causal_graph::{CausalCandidate, CausalEdge, CausalGraph, CausalNode};
 pub use device_region::{DeviceModel, DeviceRegion};
@@ -31,7 +35,14 @@ pub use persistence_region::PersistenceRegion;
 pub use preferences::Preferences;
 
 const SERIAL_MAGIC: u64 = 0xEC0_C0DE_FAB_C0FFE;
-const SERIAL_VERSION: u32 = 1;
+// v2 adds:
+//   - cumulative_surprise_since_last_persist (top-level)
+//   - persist_threshold (persistence region)
+//   - extended observation/action spaces in the operator region
+// v1 snapshots fail magic-check via the version field and the kernel
+// falls through to fresh genesis. Acceptable: pre-v2 snapshots are at
+// most a few hours old and were captured during the noisy-log era.
+const SERIAL_VERSION: u32 = 2;
 
 pub struct GenerativeModel {
     pub devices: DeviceRegion,
@@ -46,6 +57,13 @@ pub struct GenerativeModel {
     pub boot_count: u64,
     pub total_observations: u64,
     pub cumulative_surprise: f32,
+    /// Accumulated surprise across all regions since the last successful
+    /// persist. Read by `persistence.should_persist_now()` to gate
+    /// snapshot writes — when this exceeds `persistence.persist_threshold`,
+    /// the inference loop persists. Reset by `note_persist_success()`.
+    /// Replaces the old hardcoded `PERSIST_EVERY_LAMPORT = 5` cadence
+    /// with a model-resident, learnable parameter.
+    pub cumulative_surprise_since_last_persist: f32,
 }
 
 impl GenerativeModel {
@@ -63,7 +81,18 @@ impl GenerativeModel {
             boot_count: 0,
             total_observations: 0,
             cumulative_surprise: 0.0,
+            cumulative_surprise_since_last_persist: 0.0,
         }
+    }
+
+    /// Reset the unsaved-information accumulator. Called by the
+    /// inference loop after `snapshot::persist` returns Ok — the
+    /// successful write means everything currently in the model is
+    /// durable. Combined with `should_persist_now`, this gives the
+    /// kernel an information-driven persist cadence: persist when
+    /// there's information to lose, skip when there isn't.
+    pub fn note_persist_success(&mut self) {
+        self.cumulative_surprise_since_last_persist = 0.0;
     }
 
     /// Region-level summary string for the Tesseract overview line.
@@ -94,6 +123,11 @@ impl GenerativeModel {
     pub fn account_observation(&mut self, region: &str, surprise: f32, note: alloc::string::String) {
         self.total_observations = self.total_observations.saturating_add(1);
         self.cumulative_surprise += surprise;
+        // Information-since-last-save accumulator. The persist gate
+        // reads this and triggers when it exceeds the model's
+        // persist_threshold — replaces the old hardcoded lamport
+        // cadence with a learning-volume cadence.
+        self.cumulative_surprise_since_last_persist += surprise;
         self.history.push_fe(surprise);
         if surprise > 1.5 {
             self.history.push_surprise(SurpriseEntry {
@@ -127,6 +161,7 @@ impl GenerativeModel {
         out.extend_from_slice(&self.boot_count.to_le_bytes());
         out.extend_from_slice(&self.total_observations.to_le_bytes());
         out.extend_from_slice(&self.cumulative_surprise.to_le_bytes());
+        out.extend_from_slice(&self.cumulative_surprise_since_last_persist.to_le_bytes());
 
         // Devices.
         out.extend_from_slice(&(self.devices.devices.len() as u32).to_le_bytes());
@@ -146,6 +181,7 @@ impl GenerativeModel {
         out.extend_from_slice(&self.persistence.failed_persists.to_le_bytes());
         out.extend_from_slice(&self.persistence.successful_restores.to_le_bytes());
         out.extend_from_slice(&self.persistence.failed_restores.to_le_bytes());
+        out.extend_from_slice(&self.persistence.persist_threshold.to_le_bytes());
 
         // Operator.
         let o_bytes = self.operator.snapshot_bytes();
@@ -184,6 +220,7 @@ impl GenerativeModel {
         let boot_count = read_u64(bytes, &mut off)?;
         let total_observations = read_u64(bytes, &mut off)?;
         let cumulative_surprise = read_f32(bytes, &mut off)?;
+        let cumulative_surprise_since_last_persist = read_f32(bytes, &mut off)?;
 
         // Devices.
         let n_dev = read_u32(bytes, &mut off)? as usize;
@@ -217,6 +254,7 @@ impl GenerativeModel {
         persistence.failed_persists = read_u64(bytes, &mut off)?;
         persistence.successful_restores = read_u64(bytes, &mut off)?;
         persistence.failed_restores = read_u64(bytes, &mut off)?;
+        persistence.persist_threshold = read_f32(bytes, &mut off)?;
 
         // Operator.
         let no = read_u32(bytes, &mut off)? as usize;
@@ -261,11 +299,157 @@ impl GenerativeModel {
             boot_count,
             total_observations,
             cumulative_surprise,
+            cumulative_surprise_since_last_persist,
         })
     }
 }
 
 pub static MODEL: spin::Mutex<Option<GenerativeModel>> = spin::Mutex::new(None);
+
+// ---------- log candidates / submit_event ----------
+
+/// A potential interaction-log entry. The kernel produces these
+/// instead of calling `TESSERACT.lock().log_*` directly. The operator
+/// region's curator decides whether to render or absorb.
+#[derive(Clone, Debug)]
+pub enum LogCandidate {
+    /// Operator's own typed line. Always renders (force_render).
+    OperatorInput(String),
+    /// One line of a fabric command response. Always renders
+    /// (force_render).
+    FabricResponse(String),
+    /// Architecture entry markers, "genesis complete", etc.
+    Boot(String),
+    /// `observed: cpu=... mem-regions=N pci=N rsdp=...`
+    Genesis(String),
+    /// GOP info, storage info, observe-only notice, type-help prompt.
+    DeviceDiscovery(String),
+    /// Per-cycle persist outcome. ok → routine (absorbs); !ok →
+    /// failure (renders).
+    PersistOutcome {
+        ok: bool,
+        bytes: usize,
+        error: Option<String>,
+    },
+    /// Storage-agent step trace. Routine (absorbs).
+    AgentStep(String),
+    /// Meta-region self-assessment line. Borderline (absorbs).
+    MetaAssessment(String),
+    /// `restored N nodes / M edges from disk (lamport L)`. Load-bearing
+    /// (renders).
+    RestoreOk {
+        nodes: usize,
+        edges: usize,
+        lamport: u64,
+    },
+    /// `no prior snapshot (...); fresh genesis`. Boot-time (renders).
+    NoSnapshot(String),
+    /// Catch-all warning. Always renders (failure-class).
+    Failure(String),
+}
+
+impl LogCandidate {
+    fn classify(&self) -> usize {
+        use operator_region::*;
+        match self {
+            LogCandidate::OperatorInput(_) => OBS_KNOWN,
+            LogCandidate::FabricResponse(_) => OBS_KNOWN,
+            LogCandidate::Boot(_) => OBS_EVENT_GENESIS,
+            LogCandidate::Genesis(_) => OBS_EVENT_GENESIS,
+            LogCandidate::DeviceDiscovery(_) => OBS_EVENT_DEVICE_DISCOVERY,
+            LogCandidate::PersistOutcome { ok: true, .. } => OBS_EVENT_PERSIST_OK,
+            LogCandidate::PersistOutcome { ok: false, .. } => OBS_EVENT_FAILURE,
+            LogCandidate::AgentStep(_) => OBS_EVENT_AGENT_STEP,
+            LogCandidate::MetaAssessment(_) => OBS_EVENT_META,
+            LogCandidate::RestoreOk { .. } => OBS_EVENT_RESTORE_OK,
+            LogCandidate::NoSnapshot(_) => OBS_EVENT_GENESIS,
+            LogCandidate::Failure(_) => OBS_EVENT_FAILURE,
+        }
+    }
+
+    fn render(&self) -> (LogKind, String) {
+        match self {
+            LogCandidate::OperatorInput(s) => (LogKind::Operator, s.clone()),
+            LogCandidate::FabricResponse(s) => (LogKind::Fabric, s.clone()),
+            LogCandidate::Boot(s) => (LogKind::System, s.clone()),
+            LogCandidate::Genesis(s) => (LogKind::System, s.clone()),
+            LogCandidate::DeviceDiscovery(s) => (LogKind::System, s.clone()),
+            LogCandidate::PersistOutcome { ok: true, bytes, .. } => {
+                (LogKind::System, format!("persisted {} bytes", bytes))
+            }
+            LogCandidate::PersistOutcome { ok: false, error, .. } => (
+                LogKind::Warning,
+                format!(
+                    "persist failed: {}",
+                    error.as_deref().unwrap_or("unknown")
+                ),
+            ),
+            LogCandidate::AgentStep(s) => (LogKind::System, s.clone()),
+            LogCandidate::MetaAssessment(s) => (LogKind::System, s.clone()),
+            LogCandidate::RestoreOk {
+                nodes,
+                edges,
+                lamport,
+            } => (
+                LogKind::System,
+                format!(
+                    "restored {} nodes / {} edges from disk (lamport {})",
+                    nodes, edges, lamport
+                ),
+            ),
+            LogCandidate::NoSnapshot(s) => (LogKind::System, s.clone()),
+            LogCandidate::Failure(s) => (LogKind::Warning, s.clone()),
+        }
+    }
+
+    fn force_render(&self) -> bool {
+        // Operator I/O is never a "candidate" — it's literal. Failures
+        // also force-render so the operator never misses one even if
+        // the agent's belief about C drifts.
+        matches!(
+            self,
+            LogCandidate::OperatorInput(_)
+                | LogCandidate::FabricResponse(_)
+                | LogCandidate::Failure(_)
+                | LogCandidate::PersistOutcome { ok: false, .. }
+        )
+    }
+}
+
+/// Submit a log candidate to the model. ALWAYS updates the operator
+/// region's beliefs (the model learns from every event, regardless of
+/// whether the curator decides to render). Renders to the Tesseract
+/// iff the operator region's `select_render_action` returns
+/// `ACT_RENDER_TO_LOG`, OR if the candidate force-renders (operator
+/// I/O and failures).
+///
+/// Pre-nucleation (model is `None`): renders unconditionally — the
+/// kernel hasn't built its mind yet, so we can't ask it.
+pub fn submit_event(candidate: LogCandidate) {
+    let render = {
+        let mut slot = MODEL.lock();
+        match slot.as_mut() {
+            Some(model) => {
+                let obs = candidate.classify();
+                let _ = model.operator.observe_event(obs);
+                candidate.force_render()
+                    || model.operator.select_render_action(obs)
+                        == operator_region::ACT_RENDER_TO_LOG
+            }
+            None => true,
+        }
+    };
+    if render {
+        let (kind, text) = candidate.render();
+        let mut t = TESSERACT.lock();
+        match kind {
+            LogKind::System => t.log_system(text),
+            LogKind::Operator => t.log_operator(text),
+            LogKind::Fabric => t.log_fabric(text),
+            LogKind::Warning => t.log_warning(text),
+        }
+    }
+}
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());

@@ -16,7 +16,9 @@ use alloc::string::{String, ToString};
 
 use crate::fabric::FABRIC;
 use crate::framebuffer::FrameBufferWriter;
-use crate::generative_model::{DeviceModel, GenerativeModel, MODEL};
+use crate::generative_model::{
+    persistence_region, submit_event, DeviceModel, GenerativeModel, LogCandidate, MODEL,
+};
 use crate::intent;
 use crate::keyboard::LineEditor;
 use crate::ops::{Op, OpResult, Shim};
@@ -26,11 +28,12 @@ use crate::NodeKind;
 
 /// How often the storage agent runs one full step. Keeping it
 /// throttled — every Nth iteration — leaves headroom for input
-/// latency.
+/// latency. (Inference-loop scheduling, not a "what to persist" or
+/// "what to show" decision.)
 const AGENT_STEP_EVERY_TICK: u64 = 16;
-const PERSIST_EVERY_LAMPORT: u64 = 5;
 /// How often the meta-region reassesses the rest of the model. The
-/// position paper suggests every 100 primary cycles.
+/// position paper suggests every 100 primary cycles. (Same scheduling
+/// class as AGENT_STEP_EVERY_TICK.)
 const META_ASSESS_EVERY_LAMPORT: u64 = 100;
 
 pub struct LoopConfig {
@@ -48,10 +51,8 @@ pub fn run<S: Shim + ?Sized>(
 ) -> ! {
     let mut editor = LineEditor::new();
     let mut last_input_render = String::new();
-    let mut last_persist_attempt: u64 = u64::MAX;
     let mut last_agent_tick: u64 = 0;
     let mut last_meta_lamport: u64 = 0;
-    let mut intent_pending_persist = false;
 
     // ---- Nucleate the GenerativeModel and its storage device. ----
     {
@@ -170,15 +171,17 @@ pub fn run<S: Shim + ?Sized>(
         }
     }
 
-    {
-        let mut t = TESSERACT.lock();
-        t.log_system("genesis complete");
-        if cfg.agent_enabled {
-            t.log_system(format!("storage-agent online: {}", cfg.agent_label));
-        }
-        t.log_system("type help to list intents");
-        t.dirty = true;
+    submit_event(LogCandidate::Boot("genesis complete".into()));
+    if cfg.agent_enabled {
+        submit_event(LogCandidate::DeviceDiscovery(format!(
+            "storage-agent online: {}",
+            cfg.agent_label
+        )));
     }
+    submit_event(LogCandidate::DeviceDiscovery(
+        "type help to list intents".into(),
+    ));
+    TESSERACT.lock().dirty = true;
 
     {
         let f = FABRIC.lock();
@@ -205,16 +208,15 @@ pub fn run<S: Shim + ?Sized>(
                 let mut f = FABRIC.lock();
                 intent::submit(&mut f, &line)
             };
+            submit_event(LogCandidate::OperatorInput(line.clone()));
+            for resp_line in exchange.response_text.lines() {
+                submit_event(LogCandidate::FabricResponse(resp_line.into()));
+            }
             {
                 let mut t = TESSERACT.lock();
-                t.log_operator(line.clone());
-                for resp_line in exchange.response_text.lines() {
-                    t.log_fabric(resp_line);
-                }
                 t.current_input.clear();
                 t.dirty = true;
             }
-            intent_pending_persist = true;
         }
 
         let current = editor.current().to_string();
@@ -288,10 +290,12 @@ pub fn run<S: Shim + ?Sized>(
                     let mut f = FABRIC.lock();
                     let lamport = f.lamport;
                     f.create(NodeKind::SystemEvent {
-                        text: event_text,
+                        text: event_text.clone(),
                         lamport,
                     });
                 }
+
+                submit_event(LogCandidate::AgentStep(event_text));
 
                 {
                     let mut t = TESSERACT.lock();
@@ -324,12 +328,15 @@ pub fn run<S: Shim + ?Sized>(
                 })
             };
             if let Some(text) = assessment_text {
-                let mut f = FABRIC.lock();
-                let lamport = f.lamport;
-                f.create(NodeKind::SystemEvent {
-                    text,
-                    lamport,
-                });
+                {
+                    let mut f = FABRIC.lock();
+                    let lamport = f.lamport;
+                    f.create(NodeKind::SystemEvent {
+                        text: text.clone(),
+                        lamport,
+                    });
+                }
+                submit_event(LogCandidate::MetaAssessment(text));
             }
         }
 
@@ -347,81 +354,99 @@ pub fn run<S: Shim + ?Sized>(
             shim.present_frame();
         }
 
-        // 6. Persist (via the shim).
-        if cfg.persist_enabled {
-            let lamport = FABRIC.lock().lamport;
-            if last_persist_attempt == u64::MAX {
-                last_persist_attempt = lamport;
-            }
-            let due = lamport.saturating_sub(last_persist_attempt) >= PERSIST_EVERY_LAMPORT;
-            let explicit = intent::PERSIST_REQUESTED
-                .swap(false, core::sync::atomic::Ordering::AcqRel);
-            if intent_pending_persist || due || explicit {
-                // Step 7 — full-model snapshot lives as a LearnedDriver
-                // node with kind="model"; the per-device kind="storage"
-                // node is preserved as a backward-compatibility shim
-                // for older images and for emergency restore when the
-                // full-model deserialise fails.
-                let model_blob = {
-                    let slot = MODEL.lock();
-                    slot.as_ref().map(|m| {
-                        let bytes = m.serialize_to_bytes();
-                        let obs = m.total_observations;
-                        let avg = (m.average_surprise() * 1000.0) as u32;
-                        (bytes, obs, avg)
+        // 6. Persist (model-driven). The persistence region's
+        //    should_persist_now reads `cumulative_surprise_since_last_persist`
+        //    against its own `persist_threshold` (default 5.0). Replaces
+        //    the old hardcoded `PERSIST_EVERY_LAMPORT` cadence and the
+        //    `intent_pending_persist`/`PERSIST_REQUESTED` flag dance.
+        //    Operator-typed `> persist` bumps the accumulator above
+        //    threshold via `intent::command_persist`.
+        let should_persist = {
+            let slot = MODEL.lock();
+            slot.as_ref().is_some_and(|m| {
+                m.persistence
+                    .should_persist_now(m.cumulative_surprise_since_last_persist)
+            })
+        };
+        if cfg.persist_enabled && should_persist {
+            // Pick the persist variant via the existing region action
+            // selection. The structural prior favours PERSIST_ATOMIC;
+            // any of the PERSIST_* variants map to the same atomic-
+            // commit snapshot::persist call below (the Session 25d
+            // per-batch flush + read-back sentinel guarantees
+            // durability across `--kill` for all variants).
+            let action = MODEL
+                .lock()
+                .as_ref()
+                .map(|m| m.persistence.select_action())
+                .unwrap_or(persistence_region::ACT_SKIP);
+
+            // Build the LearnedDriver carrier nodes: full-model
+            // snapshot (kind="model") + per-device back-compat blob
+            // (kind="storage"). Same as before — only the gating
+            // changed.
+            let model_blob = {
+                let slot = MODEL.lock();
+                slot.as_ref().map(|m| {
+                    let bytes = m.serialize_to_bytes();
+                    let obs = m.total_observations;
+                    let avg = (m.average_surprise() * 1000.0) as u32;
+                    (bytes, obs, avg)
+                })
+            };
+            let driver_node = {
+                let slot = MODEL.lock();
+                slot.as_ref().and_then(|model| {
+                    model.devices.storage().map(|d| {
+                        let bytes = d.snapshot_bytes();
+                        let avg = (d.average_surprise() * 1000.0) as u32;
+                        (bytes, d.observations_seen(), avg)
                     })
-                };
-                let driver_node = {
-                    let slot = MODEL.lock();
-                    slot.as_ref().and_then(|model| {
-                        model.devices.storage().map(|d| {
-                            let bytes = d.snapshot_bytes();
-                            let avg = (d.average_surprise() * 1000.0) as u32;
-                            (bytes, d.observations_seen(), avg)
-                        })
-                    })
-                };
-                if let Some((bytes, obs, avg)) = model_blob {
-                    let mut f = FABRIC.lock();
-                    f.create(NodeKind::LearnedDriver {
-                        kind: "model".into(),
-                        observations: obs,
-                        avg_surprise_x1000: avg,
-                        params: bytes,
-                    });
-                }
-                if let Some((bytes, obs, avg)) = driver_node {
-                    let mut f = FABRIC.lock();
-                    f.create(NodeKind::LearnedDriver {
-                        kind: "storage".into(),
-                        observations: obs,
-                        avg_surprise_x1000: avg,
-                        params: bytes,
-                    });
-                }
-                let result = {
-                    let f = FABRIC.lock();
-                    snapshot::persist(&f, shim)
-                };
-                match result {
-                    Ok(bytes) => {
-                        let mut slot = MODEL.lock();
-                        if let Some(m) = slot.as_mut() {
-                            m.persistence.note_persist_outcome(true);
-                        }
-                        TESSERACT.lock().log_system(format!("persisted {} bytes", bytes));
-                    }
-                    Err(e) => {
-                        let mut slot = MODEL.lock();
-                        if let Some(m) = slot.as_mut() {
-                            m.persistence.note_persist_outcome(false);
-                        }
-                        TESSERACT.lock().log_warning(format!("persist failed: {}", e));
-                    }
-                }
-                last_persist_attempt = lamport;
-                intent_pending_persist = false;
+                })
+            };
+            if let Some((bytes, obs, avg)) = model_blob {
+                let mut f = FABRIC.lock();
+                f.create(NodeKind::LearnedDriver {
+                    kind: "model".into(),
+                    observations: obs,
+                    avg_surprise_x1000: avg,
+                    params: bytes,
+                });
             }
+            if let Some((bytes, obs, avg)) = driver_node {
+                let mut f = FABRIC.lock();
+                f.create(NodeKind::LearnedDriver {
+                    kind: "storage".into(),
+                    observations: obs,
+                    avg_surprise_x1000: avg,
+                    params: bytes,
+                });
+            }
+            let result = {
+                let f = FABRIC.lock();
+                snapshot::persist(&f, shim)
+            };
+            let outcome = match &result {
+                Ok(_) => persistence_region::OBS_RESTORED_OK,
+                Err(_) => persistence_region::OBS_IO_ERROR,
+            };
+            let bytes = result.as_ref().copied().unwrap_or(0);
+            let err_text = result.as_ref().err().map(|e| format!("{}", e));
+            {
+                let mut slot = MODEL.lock();
+                if let Some(m) = slot.as_mut() {
+                    m.persistence.observe(action, outcome);
+                    m.persistence.note_persist_outcome(result.is_ok());
+                    if result.is_ok() {
+                        m.note_persist_success();
+                    }
+                }
+            }
+            submit_event(LogCandidate::PersistOutcome {
+                ok: result.is_ok(),
+                bytes,
+                error: err_text,
+            });
         }
 
         // 7. Park CPU.
