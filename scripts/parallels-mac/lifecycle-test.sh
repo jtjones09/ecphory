@@ -45,7 +45,12 @@ shoot "boot1-genesis"
 
 echo "==> Type 'persist'+enter, wait for snapshot"
 "$TYPE" "$VM" --line "persist"
-sleep 4
+# Settle window before the harsh-stop kill. The post-nucleation
+# snapshot is ~150 KB (~300 blocks); even with the in-kernel flush
+# cadence and the read-back sentinel, give Parallels' host cache room
+# to acknowledge the writes. Session 25c's 4s window reproduced the
+# flush regression; 10s gives substantially more head-room.
+sleep 10
 shoot "boot1-after-persist"
 
 echo "==> Type 'model'+enter (capture the boot=1 state)"

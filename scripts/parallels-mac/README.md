@@ -15,6 +15,11 @@ whatever), then run from a Mac terminal.
 - macOS on Apple Silicon (M1/M2/M3/M4)
 - Parallels Desktop ≥ 19 — provides `prlctl`, `prl_disk_tool`
 - `uuidgen`, `plutil`, `dd` (system-default)
+- **Bash ≥ 4** — `typetext.sh` uses `declare -A` (associative arrays)
+  which is bash 4+. macOS ships system bash 3.2; `brew install bash`
+  and run the scripts via the homebrew bash. Mac-CC's Session 25c run
+  surfaced this. The script's shebang is `#!/usr/bin/env bash` so
+  whichever bash is first on PATH wins.
 
 ## Quick start
 

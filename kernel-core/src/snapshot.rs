@@ -75,22 +75,46 @@ pub fn apply(fabric: &mut Fabric, snap: Snapshot) {
 /// (which holds writes in a host-side cache and won't flush them on
 /// `prlctl stop --kill` or `--acpi` unless the guest issued an
 /// explicit BlockIO FlushBlocks).
+///
+/// Multi-block bodies (the post-nucleation full-model snapshot is
+/// ~150 KB → ~300 blocks at 512 B) need flushes *during* the body
+/// write, not just at the end. Mac-CC's Session 25c retest reproduced
+/// the cycle-1 flush regression on Apple Silicon Parallels even with
+/// the trailing FlushStorage in place: the host-side write cache
+/// defers a long sequential write run far enough that a `--kill`
+/// landing immediately after `persist` can lose the still-in-flight
+/// tail of the body. The fix is one flush per `FLUSH_EVERY_BLOCKS`
+/// blocks during the body write, plus a read-back of the superblock
+/// after the final flush to force any cache-coalesced pending writes
+/// through the read path.
 pub fn persist<S: Shim + ?Sized>(
     fabric: &Fabric,
     shim: &mut S,
 ) -> Result<usize, SnapshotError> {
+    /// Flush cadence during body write. Tuned for the Apple Silicon
+    /// Parallels host-cache behaviour observed in Session 25c — every
+    /// 32 blocks ≈ every 16 KB on a 512 B substrate, giving Parallels
+    /// regular sync points without an absurd number of FlushBlocks
+    /// calls. A 150 KB body produces ~10 intermediate flushes.
+    const FLUSH_EVERY_BLOCKS: usize = 32;
+
     let body = encode_snapshot(fabric);
     let body_len = body.len();
     let checksum = blake3::hash(&body);
 
-    // 1. Write body blocks first.
+    // 1. Write body blocks with a flush every FLUSH_EVERY_BLOCKS so
+    //    Parallels' host cache can't defer the whole body until the
+    //    very end.
     let mut lba = SNAPSHOT_LBA;
     let mut block_buf = [0u8; BLOCK_SIZE];
-    for chunk in body.chunks(BLOCK_SIZE) {
+    for (i, chunk) in body.chunks(BLOCK_SIZE).enumerate() {
         block_buf.fill(0);
         block_buf[..chunk.len()].copy_from_slice(chunk);
         write_block(shim, lba, &block_buf)?;
         lba += 1;
+        if (i + 1) % FLUSH_EVERY_BLOCKS == 0 {
+            let _ = shim.execute(Op::FlushStorage);
+        }
     }
 
     // 2. Flush body to durable storage BEFORE we name it from the superblock.
@@ -113,6 +137,16 @@ pub fn persist<S: Shim + ?Sized>(
 
     // 4. Flush superblock so the commit pointer survives the next stop.
     let _ = shim.execute(Op::FlushStorage);
+
+    // 5. Read the superblock back. Read paths force any cache-coalesced
+    //    pending writes through, because the cache hierarchy must
+    //    return the most-recent value for the LBA. This is the
+    //    quiescence sentinel: when this read returns, every prior
+    //    write to LBA 0 is at least cache-consistent. On Apple Silicon
+    //    Parallels this is the difference between cycle-1 surviving
+    //    `--kill` and not.
+    let mut readback = [0u8; BLOCK_SIZE];
+    let _ = read_block(shim, SUPERBLOCK_LBA, &mut readback);
 
     Ok(body_len)
 }
