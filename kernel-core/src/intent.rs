@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use crate::UPTIME_TICKS;
 use crate::fabric::{EdgeKind, Fabric, NodeId, NodeKind};
-use crate::generative_model::{operator_region, MODEL};
+use crate::generative_model::{operator_region, SubstrateObs, MODEL};
 use crate::tesseract::TESSERACT;
 use core::sync::atomic::Ordering;
 
@@ -35,6 +35,8 @@ pub fn submit(fabric: &mut Fabric, line: &str) -> Exchange {
     fabric.link(intent, response, EdgeKind::Causes);
 
     // Feed the operator region so it learns command-vocabulary patterns.
+    // Also emit the Constitution substrate observation: the operator
+    // addressed the kernel's single agent (nucleation in v1).
     {
         let mut slot = MODEL.lock();
         if let Some(model) = slot.as_mut() {
@@ -59,6 +61,8 @@ pub fn submit(fabric: &mut Fabric, line: &str) -> Exchange {
                 surprise,
                 first_word.clone(),
             );
+            // Constitution: the operator addressed this agent.
+            model.account_substrate_obs(SubstrateObs::OperatorAddressedMe);
         }
     }
 
@@ -187,36 +191,27 @@ fn command_model() -> String {
         model.operator.unknown_commands,
         model.operator.help_requests,
     ));
+    s.push_str("\n  ");
+    s.push_str(&model.constitution_counts.render_summary());
     s
 }
 
-fn command_agents(f: &Fabric) -> String {
-    // Agents are exposed as fabric SystemEvent + LearnedDriver nodes; we
-    // count and summarise.
-    let learned: Vec<&str> = f
-        .nodes
-        .iter()
-        .filter_map(|n| match &n.kind {
-            NodeKind::LearnedDriver { kind, .. } => Some(kind.as_str()),
-            _ => None,
-        })
-        .collect();
-    let agent_events = f
-        .iter_kind(10)
-        .filter(|n| match &n.kind {
-            NodeKind::SystemEvent { text, .. } => text.starts_with("storage:"),
-            _ => false,
-        })
-        .count();
-    if learned.is_empty() && agent_events == 0 {
-        return "no active inference agents in the fabric yet".to_string();
+fn command_agents(_f: &Fabric) -> String {
+    // Session 26: agents now come from the model's AgentRegistry, not
+    // from fabric-node scraping. The registry is the source of truth
+    // for which agents exist, their scopes, and their state.
+    let slot = MODEL.lock();
+    let model = match slot.as_ref() {
+        Some(m) => m,
+        None => return "agents: model not yet nucleated".to_string(),
+    };
+    let count = model.agents.count();
+    let mut s = format!("agents: {} in registry", count);
+    for a in &model.agents.agents {
+        s.push_str("\n  ");
+        s.push_str(&a.render_summary());
     }
-    format!(
-        "agents: {} learned-drivers ({}), {} step events",
-        learned.len(),
-        learned.join(","),
-        agent_events
-    )
+    s
 }
 
 fn command_fabric(f: &Fabric) -> String {

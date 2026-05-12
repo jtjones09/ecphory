@@ -17,7 +17,8 @@ use alloc::string::{String, ToString};
 use crate::fabric::FABRIC;
 use crate::framebuffer::FrameBufferWriter;
 use crate::generative_model::{
-    persistence_region, submit_event, DeviceModel, GenerativeModel, LogCandidate, MODEL,
+    persistence_region, submit_event, DeviceModel, GenerativeModel, LogCandidate,
+    SubstrateObs, SurprisabilityObs, MODEL,
 };
 use crate::intent;
 use crate::keyboard::LineEditor;
@@ -271,6 +272,15 @@ pub fn run<S: Shim + ?Sized>(
                     model.causal_graph.record(action_id, outcome_id);
 
                     model.account_observation("devices", surprise, note);
+                    // Constitution surprisability: every agent step
+                    // updates beliefs, and high-surprise observations
+                    // are the novelty signal the model already uses
+                    // for its surprise log. Mirror those through the
+                    // surprisability channel.
+                    model.account_surprisability_obs(SurprisabilityObs::BeliefUpdated);
+                    if surprise > 1.5 {
+                        model.account_surprisability_obs(SurprisabilityObs::NovelObservation);
+                    }
                     Some((report, summary))
                 })
             };
@@ -351,6 +361,13 @@ pub fn run<S: Shim + ?Sized>(
             drop(t);
             drop(f);
             TESSERACT.lock().dirty = false;
+            // Constitution substrate: this agent's state was rendered
+            // to the operator's display this cycle. v1 has one agent
+            // so every render counts as the nucleation agent being
+            // legible.
+            if let Some(m) = MODEL.lock().as_mut() {
+                m.account_substrate_obs(SubstrateObs::RenderedToOperator);
+            }
             shim.present_frame();
         }
 
@@ -449,7 +466,29 @@ pub fn run<S: Shim + ?Sized>(
             });
         }
 
-        // 7. Park CPU.
+        // 7. Per-agent bookkeeping (Session 26, fabric-v1). In v1 the
+        //    nucleation agent is the only entry and gets credit for
+        //    all cycle activity. The surprise window tracks recent
+        //    free-energy values; the contribution window tracks
+        //    negative ΔF (FE dropping = the agent reducing system
+        //    surprise = positive contribution). Commit 3's per-agent
+        //    step function makes this attribution per-agent rather
+        //    than whole-system.
+        {
+            let lamport_now = FABRIC.lock().lamport;
+            let mut slot = MODEL.lock();
+            if let Some(model) = slot.as_mut() {
+                let current_fe = model.history.current_fe().unwrap_or(0.0);
+                let delta_fe = model.history.delta_fe().unwrap_or(0.0);
+                if let Some(agent) = model.agents.find_mut(crate::generative_model::AgentId(0)) {
+                    agent.last_tick = lamport_now;
+                    agent.surprise_window.push(current_fe);
+                    agent.contribution_window.push(-delta_fe);
+                }
+            }
+        }
+
+        // 8. Park CPU.
         shim.execute(Op::Halt);
     }
 }

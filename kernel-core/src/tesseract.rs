@@ -123,11 +123,35 @@ pub fn render(fb: &mut FrameBufferWriter, fabric: &Fabric, tess: &Tesseract) {
     render_log(fb, &tess.log, right_x, pane_top, right_w, pane_h);
     render_prompt(fb, &tess.current_input, fabric, BORDER, pane_bottom + 8);
 
-    // Bottom of left pane: storage-agent line plus generative-model
-    // overview (boots, observations, average free energy, region
-    // map-states). The model overview comes from the global MODEL
-    // singleton and is what makes the Tesseract a window onto the
-    // *model's mind* rather than just a hardware inventory.
+    // Middle-bottom of left pane: FABRIC panel showing the agent
+    // registry (Session 26, fabric-v1). One line per agent — at
+    // nucleation just nucleation; after commit 3's lifecycle actions
+    // land, this becomes the operator's view of the fabric's specialists.
+    let fabric_y = pane_top + (pane_h * 5) / 8;
+    fb.draw_text(left_x, fabric_y, "FABRIC", BLUE);
+    let mut row = fabric_y + HEADER_HEIGHT + 4;
+    fb.draw_hline(left_x, row, left_w, Color(40, 50, 70));
+    row += LINE_SPACING + 4;
+
+    let agent_lines: alloc::vec::Vec<String> = {
+        let slot = MODEL.lock();
+        match slot.as_ref() {
+            Some(model) => model.agents.render_panel(),
+            None => alloc::vec!["agents: not yet nucleated".to_string()],
+        }
+    };
+    for line in &agent_lines {
+        for wrapped in FrameBufferWriter::wrap_lines(line, left_w) {
+            fb.draw_text(left_x, row, wrapped, GREEN);
+            row += LINE_STEP;
+        }
+    }
+
+    // Bottom of left pane: generative-model overview (boots,
+    // observations, average free energy, region map-states). The model
+    // overview comes from the global MODEL singleton and is what makes
+    // the Tesseract a window onto the *model's mind* rather than just
+    // a hardware inventory.
     let agent_y = pane_top + (pane_h * 3) / 4;
     fb.draw_text(left_x, agent_y, "GENERATIVE MODEL", BLUE);
     let mut row = agent_y + HEADER_HEIGHT + 4;

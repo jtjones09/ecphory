@@ -10,7 +10,9 @@
 //! struct exists alongside the legacy `StorageAgent` driver; Step 3
 //! retires the bare driver in favor of `DeviceRegion::storage_mut`.
 
+pub mod agents;
 pub mod causal_graph;
+pub mod constitution;
 pub mod device_region;
 pub mod history;
 pub mod meta_region;
@@ -25,7 +27,9 @@ use alloc::vec::Vec;
 
 use crate::tesseract::{LogKind, TESSERACT};
 
+pub use agents::{Agent, AgentId, AgentRegistry, AgentState, Scope, ScopeFlags, ShimOpFlags};
 pub use causal_graph::{CausalCandidate, CausalEdge, CausalGraph, CausalNode};
+pub use constitution::{Constitution, ConstitutionCounts, SubstrateObs, SurprisabilityObs};
 pub use device_region::{DeviceModel, DeviceRegion};
 pub use history::{ObservationHistory, SurpriseEntry};
 pub use meta_region::{MetaAssessment, MetaRegion};
@@ -35,14 +39,17 @@ pub use persistence_region::PersistenceRegion;
 pub use preferences::Preferences;
 
 const SERIAL_MAGIC: u64 = 0xEC0_C0DE_FAB_C0FFE;
+// v3 adds (fabric-v1 Session 26):
+//   - Constitution C-vector in Preferences (4 substrate + 3 surprisability)
+//   - ConstitutionCounts on GenerativeModel (cumulative + per-channel events)
 // v2 adds:
 //   - cumulative_surprise_since_last_persist (top-level)
 //   - persist_threshold (persistence region)
 //   - extended observation/action spaces in the operator region
-// v1 snapshots fail magic-check via the version field and the kernel
-// falls through to fresh genesis. Acceptable: pre-v2 snapshots are at
-// most a few hours old and were captured during the noisy-log era.
-const SERIAL_VERSION: u32 = 2;
+// Pre-v3 snapshots fail the version check; the kernel falls through to
+// fresh genesis. Acceptable: pre-v3 snapshots are hours old and were
+// captured before the Constitution landed.
+const SERIAL_VERSION: u32 = 3;
 
 pub struct GenerativeModel {
     pub devices: DeviceRegion,
@@ -64,6 +71,23 @@ pub struct GenerativeModel {
     /// Replaces the old hardcoded `PERSIST_EVERY_LAMPORT = 5` cadence
     /// with a model-resident, learnable parameter.
     pub cumulative_surprise_since_last_persist: f32,
+    /// Running counters for the Constitution's substrate +
+    /// surprisability observation channels (Session 26, fabric-v1).
+    /// Accounted by `account_substrate_obs` / `account_surprisability_obs`
+    /// on the same path as `account_observation`. Read by
+    /// `> model` for the constitution summary line; commit 3 of
+    /// fabric-v1 reads the per-channel totals for the lifecycle
+    /// actions' structural priors.
+    pub constitution_counts: ConstitutionCounts,
+    /// Agent registry (Session 26, fabric-v1). At nucleation the
+    /// registry holds exactly one agent: `nucleation`, id 0, full
+    /// scope. Spawned specialists in commit 3 enter here; commit 3's
+    /// `agent_step` iterates over the registry; commit 5's snapshot
+    /// preserves the registry across reboots. The handoff §2 file
+    /// map names the GenerativeModel field `fabric`; CC named it
+    /// `agents` to avoid clashing with the existing `crate::fabric`
+    /// module (the node store). Architectural intent identical.
+    pub agents: AgentRegistry,
 }
 
 impl GenerativeModel {
@@ -82,6 +106,8 @@ impl GenerativeModel {
             total_observations: 0,
             cumulative_surprise: 0.0,
             cumulative_surprise_since_last_persist: 0.0,
+            constitution_counts: ConstitutionCounts::new(),
+            agents: AgentRegistry::nucleation(),
         }
     }
 
@@ -93,6 +119,23 @@ impl GenerativeModel {
     /// there's information to lose, skip when there isn't.
     pub fn note_persist_success(&mut self) {
         self.cumulative_surprise_since_last_persist = 0.0;
+    }
+
+    /// Account a constitution substrate-channel observation. Bumps the
+    /// running total weighted by the immutable C value and increments
+    /// the per-channel event counter. Single entry point — replaces
+    /// any ad-hoc emission so the constitution stays exactly one path
+    /// in the kernel.
+    pub fn account_substrate_obs(&mut self, obs: SubstrateObs) {
+        let c = &self.preferences.constitution;
+        self.constitution_counts.account_substrate(obs, c);
+    }
+
+    /// Account a constitution surprisability-channel observation. Same
+    /// shape as `account_substrate_obs`.
+    pub fn account_surprisability_obs(&mut self, obs: SurprisabilityObs) {
+        let c = &self.preferences.constitution;
+        self.constitution_counts.account_surprisability(obs, c);
     }
 
     /// Region-level summary string for the Tesseract overview line.
@@ -201,6 +244,8 @@ impl GenerativeModel {
         self.causal_graph.serialize(&mut out);
         self.pattern_engine.serialize(&mut out);
         self.preferences.serialize(&mut out);
+        self.constitution_counts.serialize(&mut out);
+        self.agents.serialize(&mut out);
         self.history.serialize(&mut out);
 
         out
@@ -284,6 +329,8 @@ impl GenerativeModel {
         let causal_graph = CausalGraph::deserialize(bytes, &mut off)?;
         let pattern_engine = PatternEngine::deserialize(bytes, &mut off)?;
         let preferences = Preferences::deserialize(bytes, &mut off)?;
+        let constitution_counts = ConstitutionCounts::deserialize(bytes, &mut off)?;
+        let agents = AgentRegistry::deserialize(bytes, &mut off)?;
         let history = ObservationHistory::deserialize(bytes, &mut off)?;
 
         Some(Self {
@@ -300,6 +347,8 @@ impl GenerativeModel {
             total_observations,
             cumulative_surprise,
             cumulative_surprise_since_last_persist,
+            constitution_counts,
+            agents,
         })
     }
 }
